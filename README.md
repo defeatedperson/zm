@@ -51,4 +51,9 @@ npm run tauri build -- --bundles nsis
 - [Tauri 2](https://v2.tauri.app/) + Vue 3 + Vite
 - Rust + Win32（WorkerW 桌面层挂载）+ Media Foundation（硬解/硬编）
 
+## 开源说明
+
+除了软件图标（角色：艾薇·时光织语），不能被使用。
+代码内容可以随意使用，遵顼Apache2.0协议开源代码。
+
 <!-- 许可证：确定后在此补充，例如 MIT -->

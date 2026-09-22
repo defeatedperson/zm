@@ -2,7 +2,7 @@
 
 Windows 动态壁纸工具：把视频或图片设为桌面壁纸，多屏独立管理，好看更省资源。
 
-官网：<https://zm.xcdream.com>
+官网：<https://zm.xmpanel.cn>
 
 
 ## 功能特性

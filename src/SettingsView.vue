@@ -9,7 +9,7 @@ const autoStart = ref(false);
 const fullscreenPause = ref(true);
 const backupDir = ref("");
 
-const WEBSITE_URL = "https://zm.xcdream.com";
+const WEBSITE_URL = "https://zm.xmpanel.cn";
 
 async function openWebsite() {
   try {

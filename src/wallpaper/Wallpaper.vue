@@ -12,92 +12,33 @@ const imageSrc = ref("");
 const userPaused = ref(false);
 let fullscreenPaused = false;
 
-// ---- 循环无缝衔接：A/B 双 <video> 交替 + 上层交叉淡入 ----
-// 单元素 loop 重启时浏览器要 seek 回 0 并重新填充解码管线，
-// 循环点会出现几帧停顿（素材首尾衔接再好也救不回来）。
+// ---- 循环：单元素原生 loop ----
+// 循环完全交给浏览器。Chromium 的 loop 是在 media pipeline 内部回卷 demuxer，
+// 不经过 HTMLMediaElement 的 seek 路径：video layer 与 frame submitter 全程
+// 存活、readyState 不掉档、帧连续提交，所以循环点天然无缝，不需要任何 JS 介入。
 //
-// 分层策略（防闪黑的关键）：
-//   A 永远在最底层且不透明；B 在上层，通过透明度切换显示谁。
-//   交换时新活动元素先在「被盖住/透明」状态起播并预热解码，
-//   等它真正出帧（playing 事件）后才切换上层透明度做 350ms 淡入淡出。
-//   这样任何时刻屏幕上都至少有一层不透明画面——若新元素解码冷启动慢，
-//   旧画面会多停留（素材首尾衔接时观感是短暂静止，而不是闪黑）。
-const FADE_MS = 350; // 与下方 CSS 的 transition 时长保持一致
-const SWAP_AHEAD_S = 0.5; // 活动元素剩余多少秒时起播备用元素（timeupdate 约 250ms 一次）
-const elA = ref<HTMLVideoElement | null>(null);
-const elB = ref<HTMLVideoElement | null>(null);
-// B 在上层：true = B 不透明盖住 A（B 为当前画面），false = B 透明露出 A（A 为当前画面）
-const bOpaque = ref(false);
-let activeEl: HTMLVideoElement | null = null;
-let standbyEl: HTMLVideoElement | null = null;
-let parkTimer: number | null = null;
+// 反面教材（曾经踩过的坑）：A/B 双 <video> 交替 + 上层交叉淡化。
+// JS 给 currentTime 赋值会走 SeekMediaTo()，把 readyState 打回 HAVE_METADATA；
+// 而 HTMLVideoElement 的绘制入口在 readyState < HAVE_CURRENT_DATA 时直接
+// 什么都不画，于是露出容器黑底。再叠上 opacity 过渡把 video 踢出硬件叠加层，
+// 循环点必然出现 1~3 帧黑闪。这是结构性的，靠调时序消不掉。
+const videoEl = ref<HTMLVideoElement | null>(null);
 
 function applyPause() {
-  const paused = userPaused.value || fullscreenPaused;
-  // 暂停时两个元素都停（交接等待期也可能暂停）；恢复只唤醒活动元素，
-  // 备用元素保持归零待命
-  if (paused) {
-    for (const el of [elA.value, elB.value]) el?.pause();
+  const el = videoEl.value;
+  if (!el) return;
+  // 实际暂停 = 用户暂停 OR 铺满暂停，二者独立叠加
+  if (userPaused.value || fullscreenPaused) {
+    el.pause();
     return;
   }
-  activeEl?.play().catch(() => {});
-}
-
-/** 备用元素归位：暂停并回到 0 待命（被盖住/透明状态下进行，无视觉影响） */
-function park(el: HTMLVideoElement) {
-  el.pause();
-  try {
-    el.currentTime = 0;
-  } catch {
-    // 元数据未就绪时个别情况会抛错，归位失败不影响下次交换
-  }
-}
-
-/** 主备交换：新元素先起播预热，确认出帧后再切换上层透明度 */
-function swapActive() {
-  if (!activeEl || !standbyEl) return;
-  const prev = activeEl;
-  const next = standbyEl;
-  activeEl = next;
-  standbyEl = prev;
-
-  let started = false;
-  const reveal = () => {
-    // 媒体切换等场景下本回调可能已过期
-    if (started || next !== activeEl) return;
-    started = true;
-    if (parkTimer !== null) window.clearTimeout(parkTimer);
-    parkTimer = window.setTimeout(() => park(prev), FADE_MS);
-    bOpaque.value = next === elB.value;
-  };
-  // 已具备起播条件则立即切换，否则等 playing（不设超时兜底：
-  // 新元素起播再慢也只是旧画面多停留一会，强切反而会闪黑）
-  if (next.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
-    reveal();
-  } else {
-    next.addEventListener("playing", reveal, { once: true });
-  }
-  next.play().catch(() => {});
-}
-
-function onTimeUpdate(e: Event) {
-  const el = e.target as HTMLVideoElement;
-  if (el !== activeEl || !standbyEl) return;
-  if (userPaused.value || fullscreenPaused) return;
-  const d = el.duration;
-  if (!d || !Number.isFinite(d)) return;
-  if (d - el.currentTime <= SWAP_AHEAD_S) swapActive();
-}
-
-/** 兜底：timeupdate 未及触发就已播完（理论少见），结尾直接交换 */
-function onEnded(e: Event) {
-  if ((e.target as HTMLVideoElement) === activeEl) swapActive();
+  el.play().catch(() => {});
 }
 
 // 向后端上报页面真实布局（视口/媒体元素矩形/固有分辨率），用于诊断铺满问题
 async function reportState() {
   await nextTick();
-  const v = activeEl ?? elA.value;
+  const v = videoEl.value;
   let videoRect = "none";
   let intrinsic = "none";
   if (v && videoSrc.value) {
@@ -117,26 +58,13 @@ async function reportState() {
 }
 
 watch(videoSrc, async (url) => {
-  if (parkTimer !== null) {
-    window.clearTimeout(parkTimer);
-    parkTimer = null;
-  }
   await nextTick();
   if (!url) {
-    activeEl = null;
-    standbyEl = null;
-    bOpaque.value = false;
+    // v-if 卸载后 videoEl 自动为 null，这里只需补一次布局上报
     reportState();
     return;
   }
-  // 两个元素都挂载了新视频：A 在底层为活动画面，B 上层透明归零待命
-  const a = elA.value;
-  const b = elB.value;
-  if (!a || !b) return;
-  activeEl = a;
-  standbyEl = b;
-  bOpaque.value = false;
-  park(b);
+  // 新视频已挂载：按当前暂停状态起播，autoplay 只负责首次加载
   applyPause();
   reportState();
 });
@@ -196,33 +124,21 @@ onMounted(async () => {
 <template>
   <!-- 桌面壁纸窗口：完全禁用右键菜单 -->
   <div class="wallpaper" @contextmenu.prevent>
-    <template v-if="videoSrc">
-      <!-- A 永远在底层不透明（当前画面或上一画面归零待命）；
-           B 在上层，通过透明度决定显示谁，交接时淡入淡出 -->
-      <video
-        ref="elA"
-        class="video"
-        :src="videoSrc"
-        muted
-        playsinline
-        preload="auto"
-        @timeupdate="onTimeUpdate"
-        @ended="onEnded"
-        @loadedmetadata="reportState"
-      ></video>
-      <video
-        ref="elB"
-        class="video"
-        :class="{ under: !bOpaque }"
-        :src="videoSrc"
-        muted
-        playsinline
-        preload="auto"
-        @timeupdate="onTimeUpdate"
-        @ended="onEnded"
-        @loadedmetadata="reportState"
-      ></video>
-    </template>
+    <!-- 单元素 + 原生 loop：循环由浏览器 media pipeline 内部回卷 demuxer 完成，
+         不经过 JS 的 currentTime 赋值，因此没有「seek 清帧 → 不绘制」的窗口。
+         preload=auto 让整个文件进缓冲，loop 回卷就是纯内存操作，不再走网络源 -->
+    <video
+      v-if="videoSrc"
+      ref="videoEl"
+      class="video"
+      :src="videoSrc"
+      muted
+      loop
+      autoplay
+      playsinline
+      preload="auto"
+      @loadedmetadata="reportState"
+    ></video>
     <img v-else-if="imageSrc" class="video" :src="imageSrc" alt="" draggable="false" />
   </div>
 </template>
@@ -241,18 +157,13 @@ onMounted(async () => {
   background: #000;
 }
 
+/* 单层视频直接铺满。不要在这里加任何 opacity / transition：
+   那会让 video 掉出硬件叠加层直出路径，白白增加合成开销 */
 .video {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
-  /* 双视频循环交接淡入淡出时长，需与脚本中的 FADE_MS 保持一致 */
-  transition: opacity 0.35s ease;
-}
-
-/* 上层 B 待命时透明，露出底层 A */
-.video.under {
-  opacity: 0;
 }
 </style>

@@ -25,6 +25,22 @@ const WM_SPAWN_WORKERW: u32 = 0x052C;
 /// 每块显示器对应一个壁纸窗口，标签统一以该前缀开头
 const WALLPAPER_PREFIX: &str = "wallpaper-";
 
+/// 壁纸窗口专用的 WebView2 浏览器参数。
+///
+/// `CalculateNativeWinOcclusion` 必须关掉：壁纸窗口是 WorkerW 的子窗口，
+/// 常年被判定为「完全遮挡」，Chromium 会因此把页面标记为 hidden 并节流——
+/// rAF / requestVideoFrameCallback / timeupdate 都会变稀疏甚至停摆，
+/// 循环切点就此错过帧边界，表现为卡顿与衔接不准。
+///
+/// 注意：WebView2 的浏览器参数只在**浏览器进程创建时**生效，而全部窗口共用
+/// 同一进程 —— 谁先创建谁说了算（主窗口先于壁纸窗口）。所以主窗口在
+/// tauri.conf.json 里也配了同一份参数，两处必须保持一致。
+///
+/// 前面几项是 wry 的默认值，`additional_browser_args` 会整体覆盖它，
+/// 因此必须一并带上；`--autoplay-policy` 同理（wry 原本会自动追加）。
+const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
+CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required";
+
 /// 启动恢复是否已完成（get_screens 需等待它，避免把恢复中间态返回给前端）
 static RESTORE_DONE: AtomicBool = AtomicBool::new(false);
 
@@ -124,6 +140,7 @@ fn ensure_window(app: &AppHandle, label: &str, m: &Monitor) -> Result<(), String
     .resizable(false)
     .skip_taskbar(true)
     .visible(false)
+    .additional_browser_args(BROWSER_ARGS)
     .position(x, y)
     .inner_size(w, h)
     .build()
@@ -571,7 +588,7 @@ fn build_screens(app: &AppHandle) -> Result<Vec<ScreenInfo>, String> {
         let label = monitor_label(m, i);
         let size = m.size();
         out.push(ScreenInfo {
-            name: m.name().map(|s| s.to_string()).unwrap_or_else(|| format!("显示器 {}", i + 1)),
+            name: m.name().map(|| s.to_string()).unwrap_or_else(|| format!("显示器 {}", i + 1)),
             wallpaper_path: state.get(&label).cloned(),
             label,
             width: size.width,

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "LivePaper",
+  "productName": "幻梦桌面",
   "version": "0.1.0",
   "identifier": "com.livepaper.app",
   "build": {
@@ -19,7 +19,8 @@
         "minWidth": 700,
         "minHeight": 500,
         "center": true,
-        "resizable": true
+        "resizable": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required"
       }
     ],
     "security": {
@@ -42,6 +43,12 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }

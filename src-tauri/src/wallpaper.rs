@@ -8,11 +8,11 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::Graphics::Gdi::{ClientToScreen, CreateRectRgn, SetWindowRgn};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-    GWL_STYLE, GW_CHILD, GW_HWNDNEXT, SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_POPUP,
-    WS_THICKFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE,
+    FindWindowExW, FindWindowW, GetClassNameW, GetClientRect, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DLGFRAME,
+    WS_POPUP, WS_THICKFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE,
 };
 
 use crate::gallery;
@@ -176,9 +176,24 @@ unsafe fn force_fill_children(hwnd: HWND, width: i32, height: i32) {
     }
 }
 
+/// 挂载失败的统一文案：说明原因 + 给出用户可执行的操作。
+/// 该文案会透传到主窗口底部状态栏（红字），面向普通用户而非开发者。
+fn attach_unavailable(reason: &str) -> String {
+    format!(
+        "{reason}，已停止挂载动态壁纸（可能与 Wallpaper Engine 等壁纸软件冲突，或 explorer 刚重启）。\
+         请完全退出其他壁纸软件后重试；若仍失败，请重启资源管理器（explorer）后再试"
+    )
+}
+
 /// 定位桌面图标层背后的 WorkerW（必要时先生成）。
-unsafe fn find_or_spawn_workerw() -> windows::core::Result<HWND> {
-    let progman = FindWindowW(w!("Progman"), PCWSTR::null())?;
+///
+/// 任何一步失败都必须返回 Err 并放弃挂载：把壁纸窗口直接挂到 Progman
+/// 会让它盖住桌面图标层（SHELLDLL_DefView），表现为"整个桌面只剩
+/// 任务栏可见"——任务栏是独立 topmost 窗口不受影响，图标层却会被
+/// 完全遮住。宁可不出壁纸，也不能盖住用户的桌面。
+unsafe fn find_or_spawn_workerw() -> Result<HWND, String> {
+    let progman = FindWindowW(w!("Progman"), PCWSTR::null())
+        .map_err(|_| attach_unavailable("未找到桌面窗口 Progman"))?;
     // 幂等操作：WorkerW 已存在时重复发送无副作用
     let _ = SendMessageTimeoutW(
         progman,
@@ -189,20 +204,36 @@ unsafe fn find_or_spawn_workerw() -> windows::core::Result<HWND> {
         1000,
         None,
     );
-    // 标准做法：桌面图标层 SHELLDLL_DefView 是 Progman 的子窗口，
-    // z-order 中紧挨其后的兄弟窗口就是我们要的 WorkerW
-    if let Ok(defview) = FindWindowExW(
+    // 桌面图标层 SHELLDLL_DefView 必须是 Progman 的直接子窗口。
+    // 找不到说明桌面结构异常（explorer 重启后图标层可能被挂到别处，
+    // 或正被其他壁纸工具重建），此时无法安全定位挂载点
+    let defview = FindWindowExW(
         Some(progman),
         None,
         w!("SHELLDLL_DefView"),
         PCWSTR::null(),
-    ) {
-        if let Ok(workerw) = GetWindow(defview, GW_HWNDNEXT) {
-            return Ok(workerw);
+    )
+    .map_err(|_| attach_unavailable("未找到桌面图标层 SHELLDLL_DefView"))?;
+    // 沿 Z 序向后找类名为 WorkerW 的兄弟窗口。不直接取第一个兄弟：
+    // Wallpaper Engine 等工具可能在图标层后面插入自己的窗口，
+    // 挂到那种窗口上等于挂错宿主
+    let mut cur = defview;
+    for _ in 0..16 {
+        let next = GetWindow(cur, GW_HWNDNEXT)
+            .map_err(|e| attach_unavailable(&format!("枚举桌面窗口失败: {e}")))?;
+        if next.0 as usize == 0 {
+            break;
         }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(next, &mut buf);
+        if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "WorkerW" {
+            return Ok(next);
+        }
+        cur = next;
     }
-    // 找不到时（例如隐藏了桌面图标）直接挂到 Progman
-    Ok(progman)
+    Err(attach_unavailable(
+        "桌面图标层之后不存在可挂载的 WorkerW",
+    ))
 }
 
 /// 把每块显示器的壁纸窗口挂到 WorkerW 之下，用物理像素精确贴合该屏矩形。
@@ -211,7 +242,7 @@ unsafe fn find_or_spawn_workerw() -> windows::core::Result<HWND> {
 fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
     println!("[wallpaper] attach v3 (force-fill){}", only.map(|l| format!(" [{l}]")).unwrap_or_default());
     unsafe {
-        let host = find_or_spawn_workerw().map_err(|e| format!("定位 WorkerW 失败: {e}"))?;
+        let host = find_or_spawn_workerw()?;
         let mut host_rect = RECT::default();
         GetWindowRect(host, &mut host_rect).map_err(|e| format!("获取桌面区域失败: {e}"))?;
         println!(
@@ -469,6 +500,8 @@ pub fn restore_from_settings(app: &AppHandle) {
         // 挂载（内部懒创建窗口）；页面加载完成会通过 get_wallpaper_media 拉取自己的壁纸
         if let Err(e) = attach_wallpaper_windows(app, Some(&label)) {
             println!("[wallpaper] 恢复 {label} 挂载失败: {e}");
+            // 后台线程静默失败用户无从感知，广播给主窗口状态栏红字提示
+            let _ = app.emit("wallpaper:attach-error", format!("启动恢复动态壁纸失败：{e}"));
             continue;
         }
         if let Ok(mut state) = wallpaper_state().lock() {

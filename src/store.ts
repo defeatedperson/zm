@@ -86,6 +86,10 @@ export async function initApp() {
   void listen<boolean>("wallpaper:user-paused", (event) => {
     store.userPaused = event.payload;
   });
+  // 启动恢复挂载失败（如与 Wallpaper Engine 冲突）：红字提示原因与处理办法
+  void listen<string>("wallpaper:attach-error", (event) => {
+    setStatus(event.payload, true);
+  });
   // 存量视频元数据回填完成后刷新画廊（徽标显示分辨率/帧率）
   void listen("gallery:meta-updated", () => {
     void refresh();

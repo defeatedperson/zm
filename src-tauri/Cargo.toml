@@ -1,6 +1,6 @@
 [package]
 name = "livepaper"
-version = "0.2.0"
+version = "0.2.3"
 description = "幻梦桌面 - Windows 动态壁纸工具"
 authors = ["you"]
 edition = "2021"
@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
+tauri-plugin-single-instance = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }

@@ -6,20 +6,26 @@ use tauri::{AppHandle, Emitter, Manager, Monitor, WebviewUrl, WebviewWindowBuild
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::Graphics::Gdi::{ClientToScreen, CreateRectRgn, SetWindowRgn};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CreateRectRgn, RedrawWindow, SetWindowRgn, RDW_ALLCHILDREN, RDW_ERASE,
+    RDW_INVALIDATE, RDW_UPDATENOW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetClassNameW, GetClientRect, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DLGFRAME,
-    WS_POPUP, WS_THICKFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE,
+    FindWindowExW, FindWindowW, GetClassNameW, GetClientRect, GetParent, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, SendMessageTimeoutW, SetParent, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, SMTO_NORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_POPUP, WS_THICKFRAME, WS_EX_CLIENTEDGE,
+    WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE,
 };
 
 use crate::gallery;
 use crate::settings;
 
-/// 向 Progman 发送该消息后，系统会在桌面图标层（SHELLDLL_DefView）后面
-/// 生成一个 WorkerW 窗口，它是动态壁纸的宿主层。
+/// 向 Progman 发送该消息后，系统会确保桌面图标层（SHELLDLL_DefView）后面
+/// 存在 WorkerW 窗口，它是动态壁纸的宿主层。未文档化消息（社区称
+/// WM_SHELLPARENTCHANGING），Win10 22H2 实测仍有效，但生成层级形态不唯一，
+/// 见 [find_or_spawn_workerw] 的注释。
 const WM_SPAWN_WORKERW: u32 = 0x052C;
 
 /// 每块显示器对应一个壁纸窗口，标签统一以该前缀开头
@@ -206,55 +212,111 @@ fn attach_unavailable(reason: &str) -> String {
     )
 }
 
-/// 定位桌面图标层背后的 WorkerW（必要时先生成）。
+/// 读取窗口类名，失败返回 None。
+unsafe fn class_name(hwnd: HWND) -> Option<String> {
+    let mut buf = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut buf);
+    if n > 0 {
+        Some(String::from_utf16_lossy(&buf[..n as usize]))
+    } else {
+        None
+    }
+}
+
+/// 定位桌面图标层背后的 WorkerW 宿主层（必要时先生成）。
 ///
 /// 任何一步失败都必须返回 Err 并放弃挂载：把壁纸窗口直接挂到 Progman
-/// 会让它盖住桌面图标层（SHELLDLL_DefView），表现为"整个桌面只剩
+/// 正面会盖住桌面图标层（SHELLDLL_DefView），表现为"整个桌面只剩
 /// 任务栏可见"——任务栏是独立 topmost 窗口不受影响，图标层却会被
 /// 完全遮住。宁可不出壁纸，也不能盖住用户的桌面。
+///
+/// 桌面窗口层级是未文档化行为，实测至少三种形态并存：
+/// - A：DefView 与 0x052C 生成的 WorkerW 都是 Progman 的子窗口（旧假设）
+/// - B：DefView 被重新挂到顶级 WorkerW 下（Win8+ 发送 0x052C 后、系统启用
+///   幻灯片壁纸时、Wallpaper Engine 等接管后），壁纸挂其后的顶级 WorkerW
+/// - C：DefView 是 Progman 子窗口，但 WorkerW 是顶级窗口、Z 序在 Progman 后
+///
+/// 因此与同类软件（Wallpaper Engine / Lively / MSDN 官方示例）保持一致：
+/// 先找 DefView 所在的宿主（不预设 Progman 还是 WorkerW），再按兄弟 Z 序、
+/// 顶级 Z 序两步定位挂载点，全程带退避重试（WorkerW 生成存在异步时机，
+/// explorer 忙碌或刚重启时会延迟出现）。
 unsafe fn find_or_spawn_workerw() -> Result<HWND, String> {
     let progman = FindWindowW(w!("Progman"), PCWSTR::null())
         .map_err(|_| attach_unavailable("未找到桌面窗口 Progman"))?;
-    // 幂等操作：WorkerW 已存在时重复发送无副作用
-    let _ = SendMessageTimeoutW(
-        progman,
-        WM_SPAWN_WORKERW,
-        WPARAM(0),
-        LPARAM(0),
-        SMTO_NORMAL,
-        1000,
-        None,
-    );
-    // 桌面图标层 SHELLDLL_DefView 必须是 Progman 的直接子窗口。
-    // 找不到说明桌面结构异常（explorer 重启后图标层可能被挂到别处，
-    // 或正被其他壁纸工具重建），此时无法安全定位挂载点
+    let mut last_err = String::new();
+    // 首轮立即尝试，之后退避重试，给 explorer 留出构建桌面层级的时间
+    for delay_ms in [0u64, 100, 300, 600, 1000] {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        // 幂等操作：WorkerW 已存在时重复发送无副作用
+        let _ = SendMessageTimeoutW(
+            progman,
+            WM_SPAWN_WORKERW,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_NORMAL,
+            1000,
+            None,
+        );
+        match locate_host_layer(progman) {
+            Ok(host) => return Ok(host),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// 在上述各种桌面层级形态下定位可挂载的 WorkerW。
+unsafe fn locate_host_layer(progman: HWND) -> Result<HWND, String> {
+    // 桌面图标层的宿主：形态 A/C 下是 Progman，形态 B 下是一个顶级 WorkerW。
+    // 两种都查不到说明图标层不存在（用户关闭了"显示桌面图标"，
+    // 或 explorer 正在重建桌面），无法安全定位挂载点
+    let defview_host = find_defview_host(progman)
+        .ok_or_else(|| attach_unavailable("未找到桌面图标层 SHELLDLL_DefView"))?;
     let defview = FindWindowExW(
-        Some(progman),
+        Some(defview_host),
         None,
         w!("SHELLDLL_DefView"),
         PCWSTR::null(),
     )
     .map_err(|_| attach_unavailable("未找到桌面图标层 SHELLDLL_DefView"))?;
-    // 沿 Z 序向后找类名为 WorkerW 的兄弟窗口。不直接取第一个兄弟：
-    // Wallpaper Engine 等工具可能在图标层后面插入自己的窗口，
+    // 第一步（形态 A）：兄弟 Z 序 —— DefView 同级的 WorkerW，即宿主的子窗口。
+    // 不直接取第一个兄弟：其他壁纸工具可能在图标层后面插入自己的窗口，
     // 挂到那种窗口上等于挂错宿主
     let mut cur = defview;
     for _ in 0..16 {
-        let next = GetWindow(cur, GW_HWNDNEXT)
-            .map_err(|e| attach_unavailable(&format!("枚举桌面窗口失败: {e}")))?;
+        let Ok(next) = GetWindow(cur, GW_HWNDNEXT) else {
+            break;
+        };
         if next.0 as usize == 0 {
             break;
         }
-        let mut buf = [0u16; 64];
-        let n = GetClassNameW(next, &mut buf);
-        if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "WorkerW" {
+        if class_name(next).as_deref() == Some("WorkerW") {
             return Ok(next);
         }
         cur = next;
     }
-    Err(attach_unavailable(
-        "桌面图标层之后不存在可挂载的 WorkerW",
-    ))
+    // 第二步（形态 B/C）：顶级 Z 序 —— DefView 宿主之后的第一个顶级 WorkerW。
+    // MSDN 官方示例 / Wallpaper Engine / Lively 的通用做法
+    FindWindowExW(None, Some(defview_host), w!("WorkerW"), PCWSTR::null())
+        .map_err(|_| attach_unavailable("桌面图标层之后不存在可挂载的 WorkerW"))
+}
+
+/// 找到桌面图标层 SHELLDLL_DefView 的宿主顶级窗口：
+/// 先看 Progman 直接子窗口（形态 A/C），再枚举顶级 WorkerW（形态 B）。
+unsafe fn find_defview_host(progman: HWND) -> Option<HWND> {
+    if FindWindowExW(Some(progman), None, w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok() {
+        return Some(progman);
+    }
+    let mut after: Option<HWND> = None;
+    while let Ok(worker) = FindWindowExW(None, after, w!("WorkerW"), PCWSTR::null()) {
+        if FindWindowExW(Some(worker), None, w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok() {
+            return Some(worker);
+        }
+        after = Some(worker);
+    }
+    None
 }
 
 /// 把每块显示器的壁纸窗口挂到 WorkerW 之下，用物理像素精确贴合该屏矩形。
@@ -382,6 +444,8 @@ fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), S
 /// 隐藏壁纸窗口并脱离桌面层，恢复系统静态壁纸。
 /// `only` 传入时只处理标签匹配的那块屏。
 fn detach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
+    // 被卸载壁纸的宿主 WorkerW，全部卸完后统一触发重绘
+    let mut hosts: Vec<HWND> = Vec::new();
     for win in app.webview_windows().values() {
         if !win.label().starts_with(WALLPAPER_PREFIX) {
             continue;
@@ -394,16 +458,36 @@ fn detach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), S
         let raw = win.hwnd().map_err(|e| format!("获取窗口句柄失败: {e}"))?;
         let hwnd = HWND(raw.0);
         unsafe {
-            // 先移除挂载时的可见区域裁剪，恢复窗口默认形态
-            let _ = SetWindowRgn(hwnd, None, true);
-            // 壁纸窗口的显示状态一直绕过框架、由 Win32 直接管理，
-            // 因此隐藏也必须走 Win32，避免框架内部状态与真实状态不同步
+            // 必须先隐藏再恢复窗口形态：若在可见状态下 SetWindowRgn(…, true)
+            // 会触发一次整窗重绘，而窗口随即被销毁，个别机器上 DWM 来不及
+            // 回收这一帧，就在桌面顶部留下条状残影（形似窗口标题栏，切换
+            // 系统壁纸才被冲掉）。隐藏后恢复区域无需重绘
             let _ = ShowWindow(hwnd, SW_HIDE);
+            let _ = SetWindowRgn(hwnd, None, false);
+            // 记录宿主，稍后统一强制重绘
+            if let Ok(host) = GetParent(hwnd) {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
             // 恢复为顶层无边框窗口，保持下次挂载前的干净状态
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as usize;
             let new_style = (style & !(WS_CHILD.0 as usize)) | WS_POPUP.0 as usize;
             SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
             let _ = SetParent(hwnd, None);
+        }
+    }
+    // 壁纸窗口消失后，宿主 WorkerW 不会自动重绘其原覆盖区域，可能继续
+    // 显示 DWM 缓存的最后一帧。显式失效整棵宿主树强制立即重绘，确保
+    // 静态壁纸马上透出来（同类软件退出时的通用处理）
+    for host in hosts {
+        unsafe {
+            let _ = RedrawWindow(
+                Some(host),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
         }
     }
     Ok(())

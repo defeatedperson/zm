@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, Manager, Monitor};
+use tauri::{AppHandle, Emitter, Monitor};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -100,8 +100,8 @@ fn resume_all(app: &AppHandle, monitors: &[Monitor]) -> Result<(), String> {
 }
 
 fn list_monitors(app: &AppHandle) -> Result<Vec<Monitor>, String> {
-    let main = app.get_webview_window("main").ok_or("主窗口未创建")?;
-    main.available_monitors()
+    // 同 wallpaper::list_monitors：不能依赖主窗口，静默启动时它还没有 WebView2
+    app.available_monitors()
         .map_err(|e| format!("枚举显示器失败: {e}"))
 }
 

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口与各壁纸窗口的默认能力",
-  "windows": ["main", "wallpaper-*"],
+  "description": "主窗口、各壁纸窗口与静默启动的预热窗口的默认能力",
+  "windows": ["main", "wallpaper-*", "warmup"],
   "permissions": [
     "core:default",
     "opener:default",

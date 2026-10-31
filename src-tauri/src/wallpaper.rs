@@ -31,7 +31,7 @@ const WM_SPAWN_WORKERW: u32 = 0x052C;
 /// 每块显示器对应一个壁纸窗口，标签统一以该前缀开头
 const WALLPAPER_PREFIX: &str = "wallpaper-";
 
-/// 壁纸窗口专用的 WebView2 浏览器参数。
+/// WebView2 浏览器参数（壁纸窗口与静默启动的预热窗口共用）。
 ///
 /// `CalculateNativeWinOcclusion` 必须关掉：壁纸窗口是 WorkerW 的子窗口，
 /// 常年被判定为「完全遮挡」，Chromium 会因此把页面标记为 hidden 并节流——
@@ -39,12 +39,13 @@ const WALLPAPER_PREFIX: &str = "wallpaper-";
 /// 循环切点就此错过帧边界，表现为卡顿与衔接不准。
 ///
 /// 注意：WebView2 的浏览器参数只在**浏览器进程创建时**生效，而全部窗口共用
-/// 同一进程 —— 谁先创建谁说了算（主窗口先于壁纸窗口）。所以主窗口在
-/// tauri.conf.json 里也配了同一份参数，两处必须保持一致。
+/// 同一进程 —— 谁先创建谁说了算。手动启动时是主窗口先建（所以 tauri.conf.json
+/// 里配了同一份参数，两处必须保持一致）；开机自启静默启动时主窗口不出现，
+/// 最先建的是 lib.rs 的预热窗口，它也必须带上这份参数。
 ///
 /// 前面几项是 wry 的默认值，`additional_browser_args` 会整体覆盖它，
 /// 因此必须一并带上；`--autoplay-policy` 同理（wry 原本会自动追加）。
-const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
+pub(crate) const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
 CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required";
 
 /// 启动恢复是否已完成（get_screens 需等待它，避免把恢复中间态返回给前端）
@@ -112,6 +113,31 @@ pub fn clear_last_wallpaper() {
     }
 }
 
+/// 最近一次挂载失败的原因。静默启动（开机自启）时主窗口不显示，前端可能
+/// 还没注册监听导致事件丢失，所以存一份供初始化时主动拉取。
+fn last_attach_error() -> &'static Mutex<Option<String>> {
+    static ERR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    ERR.get_or_init(|| Mutex::new(None))
+}
+
+fn record_attach_error(msg: &str) {
+    if let Ok(mut e) = last_attach_error().lock() {
+        *e = Some(msg.to_string());
+    }
+}
+
+fn clear_attach_error() {
+    if let Ok(mut e) = last_attach_error().lock() {
+        *e = None;
+    }
+}
+
+/// 查询最近一次挂载失败的原因（从未失败为 None）
+#[tauri::command]
+pub fn get_last_attach_error() -> Option<String> {
+    last_attach_error().lock().ok().and_then(|e| e.clone())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScreenInfo {
@@ -135,9 +161,14 @@ pub fn monitor_label(m: &Monitor, index: usize) -> String {
     format!("{WALLPAPER_PREFIX}{index}")
 }
 
+/// 枚举显示器。
+///
+/// 必须走 AppHandle 而不是主窗口：开机自启是静默启动，主窗口（配置里
+/// visible=false）在首次 show() 前根本没有 WebView2，用窗口级 API 会一直报
+/// 「failed to receive message from webview」，导致启动恢复与全屏检测全部失效。
+/// 而挂载壁纸本身就需要显示器列表，依赖主窗口会形成死结。
 fn list_monitors(app: &AppHandle) -> Result<Vec<Monitor>, String> {
-    let main = app.get_webview_window("main").ok_or("主窗口未创建")?;
-    main.available_monitors()
+    app.available_monitors()
         .map_err(|e| format!("枚举显示器失败: {e}"))
 }
 
@@ -319,6 +350,27 @@ unsafe fn find_defview_host(progman: HWND) -> Option<HWND> {
     None
 }
 
+/// 等待壁纸窗口的句柄就绪（安全网）。
+///
+/// 隐藏创建的窗口，其 WebView2 控制器与窗口句柄由主线程异步补上，`build()` 返回时
+/// 理论上可能还没好。正常情况下环境已被预热（手动启动是主窗口，静默启动是 lib.rs
+/// 的预热窗口），句柄是即时可用的；这里仍重试等待最多约 5 秒，避免在慢机器上
+/// 因为一次竞态就把用户的壁纸弄没了。
+fn wait_hwnd(win: &tauri::WebviewWindow, label: &str) -> Result<HWND, String> {
+    for i in 0..250 {
+        match win.hwnd() {
+            Ok(raw) => return Ok(HWND(raw.0)),
+            Err(e) => {
+                if i == 0 {
+                    println!("[wallpaper] {label}: 窗口句柄未就绪，等待中（{e}）");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    Err(format!("等待窗口句柄超时: {label}"))
+}
+
 /// 把每块显示器的壁纸窗口挂到 WorkerW 之下，用物理像素精确贴合该屏矩形。
 /// 每屏一个窗口、窗口内铺满视口，因此天然规避跨屏 DPI 换算误差。
 /// `only` 传入时只挂载标签匹配的那块屏（单屏应用壁纸）。
@@ -345,8 +397,7 @@ fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), S
             let Some(win) = app.get_webview_window(&label) else {
                 continue;
             };
-            let raw = win.hwnd().map_err(|e| format!("获取窗口句柄失败: {e}"))?;
-            let hwnd = HWND(raw.0);
+            let hwnd = wait_hwnd(&win, &label)?;
             println!(
                 "[wallpaper] {label}: monitor={:?} pos=({},{}) size={}x{} scale={} dpi={}",
                 m.name(),
@@ -546,6 +597,8 @@ pub async fn set_wallpaper_on(
     if let Ok(mut last) = last_wallpaper().lock() {
         *last = Some(path);
     }
+    // 本次挂载成功，启动恢复阶段残留的失败原因不再有效
+    clear_attach_error();
     Ok(())
 }
 
@@ -580,6 +633,8 @@ pub fn start_restore(app: AppHandle) {
 
 /// 启动时按持久化的分配恢复每屏壁纸（文件已删除或屏幕不存在的项自动跳过）
 pub fn restore_from_settings(app: &AppHandle) {
+    // 新会话开始，先清掉上一轮可能残留的失败原因
+    clear_attach_error();
     let settings = settings::load(app);
     if settings.wallpaper_assignments.is_empty() {
         return;
@@ -608,8 +663,14 @@ pub fn restore_from_settings(app: &AppHandle) {
         // 挂载（内部懒创建窗口）；页面加载完成会通过 get_wallpaper_media 拉取自己的壁纸
         if let Err(e) = attach_wallpaper_windows(app, Some(&label)) {
             println!("[wallpaper] 恢复 {label} 挂载失败: {e}");
+            let msg = format!("启动恢复动态壁纸失败：{e}");
+            record_attach_error(&msg);
             // 后台线程静默失败用户无从感知，广播给主窗口状态栏红字提示
-            let _ = app.emit("wallpaper:attach-error", format!("启动恢复动态壁纸失败：{e}"));
+            let _ = app.emit("wallpaper:attach-error", &msg);
+            // 开机自启是静默启动，平时不弹主窗口；真失败时必须让用户看到原因
+            if crate::launched_hidden() {
+                crate::show_main_window(app);
+            }
             continue;
         }
         if let Ok(mut state) = wallpaper_state().lock() {
@@ -698,6 +759,9 @@ pub async fn unset_wallpaper_on(app: AppHandle, label: Option<String>) -> Result
         }
         settings::update_assignments(&app, |m| m.clear());
     }
+    // 用户主动清除了壁纸：此前启动恢复残留的失败原因不再有意义，
+    // 避免主窗口下次初始化时又拉出陈旧的红字报错
+    clear_attach_error();
     Ok(())
 }
 

@@ -101,6 +101,14 @@ export async function initApp() {
     store.importPercent =
       total > 0 ? Math.min(100, Math.floor((copied / total) * 100)) : 0;
   });
+  // 开机自启是静默启动，挂载失败可能早于上面的监听注册（事件会丢），
+  // 所以再把后端存着的原因拉一次，保证弹窗时状态栏有内容
+  try {
+    const pending = await invoke<string | null>("get_last_attach_error");
+    if (pending) setStatus(pending, true);
+  } catch {
+    // 拉不到就保持当前状态，不影响主流程
+  }
 }
 
 /** 切换用户暂停（仅冻结画面，不卸载壁纸） */

@@ -1,6 +1,6 @@
 [package]
 name = "livepaper"
-version = "0.2.4"
+version = "0.2.5"
 description = "幻梦桌面 - Windows 动态壁纸工具"
 authors = ["you"]
 edition = "2021"

@@ -1,13 +1,16 @@
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, Monitor, WebviewUrl, WebviewWindowBuilder};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, HWND, LPARAM, POINT, RECT, WIN32_ERROR, WPARAM,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+    DPI_AWARENESS_CONTEXT_UNAWARE,
+};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateRectRgn, RedrawWindow, SetWindowRgn, RDW_ALLCHILDREN, RDW_ERASE,
     RDW_INVALIDATE, RDW_UPDATENOW,
@@ -52,6 +55,16 @@ CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required";
 
 /// 启动恢复是否已完成（get_screens 需等待它，避免把恢复中间态返回给前端）
 static RESTORE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// H1 兼容模式：壁纸窗口以 DPI-unaware 上下文创建（见 build_wallpaper_window_unaware）。
+/// 置位后本会话内所有壁纸窗口重建都走 unaware 创建，避免每块屏都失败重试一遍
+static WALLPAPER_DPI_UNAWARE: AtomicBool = AtomicBool::new(false);
+
+/// 事件循环线程切换 DPI 上下文前的原值（0 = NULL，表示切换失败、无需恢复）
+static THREAD_DPI_BEFORE: AtomicIsize = AtomicIsize::new(0);
+
+/// SetParent 被桌面宿主拒绝的错误标记（attach 重试逻辑据此判定）
+const SETPARENT_REJECTED_MARK: &str = "SetParent 返回 NULL";
 
 /// 用户手动暂停（仅冻结画面，不卸载壁纸；会话级，重启后恢复播放）
 static USER_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -190,7 +203,7 @@ fn ensure_window(app: &AppHandle, label: &str, m: &Monitor) -> Result<(), String
     let y = m.position().y as f64 / scale;
     let w = m.size().width as f64 / scale;
     let h = m.size().height as f64 / scale;
-    WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         label,
         WebviewUrl::App("wallpaper.html".into()),
@@ -202,9 +215,39 @@ fn ensure_window(app: &AppHandle, label: &str, m: &Monitor) -> Result<(), String
     .visible(false)
     .additional_browser_args(BROWSER_ARGS)
     .position(x, y)
-    .inner_size(w, h)
-    .build()
-    .map_err(|e| format!("创建壁纸窗口 {label} 失败: {e}"))?;
+    .inner_size(w, h);
+    let built = if WALLPAPER_DPI_UNAWARE.load(Ordering::Relaxed) {
+        // H1 兼容模式：以 DPI-unaware 上下文创建壁纸窗口。
+        // 窗口的 DPI 上下文在创建瞬间取自创建线程；事件循环线程平时是
+        // Per-Monitor V2（主窗口需要），而部分 Win11 24H2 机器的桌面宿主
+        // （Progman/WorkerW）不是 PMv2——PMv2 子窗口 SetParent 进非 PMv2 宿主
+        // 会被系统直接拒绝（返回 NULL 且不设错误码，用户实测）。壁纸窗口按
+        // 物理像素定位铺屏、内容无需 DPI 缩放，临时切换即可绕开限制。
+        if let Err(e) = app.run_on_main_thread(|| unsafe {
+            let old = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+            THREAD_DPI_BEFORE.store(old.0 as isize, Ordering::Relaxed);
+        }) {
+            println!("[wallpaper] 切换线程 DPI 上下文失败，按默认上下文创建: {e}");
+            builder.build()
+        } else {
+            // build 会把创建请求投递回事件循环线程执行，此刻线程上下文为 unaware
+            let built = builder.build();
+            // 创建完成立即恢复原上下文（old 为 0 说明切换未生效，无需恢复），
+            // 主窗口、托盘与其他窗口不受影响
+            if let Err(e) = app.run_on_main_thread(|| unsafe {
+                let prev = THREAD_DPI_BEFORE.load(Ordering::Relaxed);
+                if prev != 0 {
+                    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT(prev as *mut _));
+                }
+            }) {
+                println!("[wallpaper] 恢复线程 DPI 上下文投递失败（不影响已创建窗口）: {e}");
+            }
+            built
+        }
+    } else {
+        builder.build()
+    };
+    built.map_err(|e| format!("创建壁纸窗口 {label} 失败: {e}"))?;
     Ok(())
 }
 
@@ -430,11 +473,46 @@ fn wait_hwnd(win: &tauri::WebviewWindow, label: &str) -> Result<HWND, String> {
     Err(format!("等待窗口句柄超时: {label}"))
 }
 
+/// 挂载入口：先按正常流程执行一次；若 SetParent 被桌面宿主以 DPI 上下文
+/// 不兼容为由拒绝（部分 Win11 24H2 机器，见 build_wallpaper_window_unaware），
+/// 则销毁壁纸窗口、切换 DPI-unaware 创建模式后整体重试一次。
+fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
+    match attach_wallpaper_windows_once(app, only) {
+        Err(e)
+            if e.contains(SETPARENT_REJECTED_MARK)
+                && !WALLPAPER_DPI_UNAWARE.swap(true, Ordering::Relaxed) =>
+        {
+            println!(
+                "[wallpaper] SetParent 被桌面宿主拒绝，切换 DPI-unaware 创建模式，重建壁纸窗口重试"
+            );
+            destroy_wallpaper_windows(app, only);
+            attach_wallpaper_windows_once(app, only)
+        }
+        other => other,
+    }
+}
+
+/// 销毁壁纸窗口（`only` 匹配的那块屏；None 为全部），供 DPI 兼容模式整体重建
+fn destroy_wallpaper_windows(app: &AppHandle, only: Option<&str>) {
+    let labels: Vec<String> = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(WALLPAPER_PREFIX))
+        .filter(|(name, _)| only.map(|t| name == t).unwrap_or(true))
+        .map(|(name, _)| name)
+        .collect();
+    for l in labels {
+        if let Some(win) = app.get_webview_window(&l) {
+            let _ = win.destroy();
+        }
+    }
+}
+
 /// 把每块显示器的壁纸窗口挂到桌面层（WorkerW，或兜底时 DefView 宿主）之下，
 /// 用物理像素精确贴合该屏矩形。
 /// 每屏一个窗口、窗口内铺满视口，因此天然规避跨屏 DPI 换算误差。
 /// `only` 传入时只挂载标签匹配的那块屏（单屏应用壁纸）。
-fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
+fn attach_wallpaper_windows_once(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
     println!("[wallpaper] attach v4 (force-fill + fallback){}", only.map(|l| format!(" [{l}]")).unwrap_or_default());
     unsafe {
         let (host, behind) = find_or_spawn_workerw()?;
@@ -484,7 +562,26 @@ fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), S
                 (WS_EX_CLIENTEDGE.0 | WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0) as usize;
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex_style & !ex_frames) as isize);
 
-            SetParent(hwnd, Some(host)).map_err(|e| format!("挂载到桌面层失败: {e}"))?;
+            // SetParent 陷阱：成功时返回的是「旧父窗口句柄」，而挂载前的壁纸窗口
+            // 是无父无属主的顶级窗口——没有旧父。部分机器（实测某 Win11 24H2）
+            // 此时成功也返回 NULL 且不设错误码，windows-rs 会误判为失败，报出
+            // 「挂载到桌面层失败: 操作成功完成。 (0x0)」而中断流程。
+            // 对错误码 0 的情况改用 GetParent 校验实际父子关系，以事实为准
+            let attached = match SetParent(hwnd, Some(host)) {
+                Ok(_) => true,
+                Err(e) if e.code().0 == 0 => {
+                    println!(
+                        "[wallpaper] {label}: SetParent 返回 NULL 且错误码为 0，以 GetParent 校验实际挂载结果"
+                    );
+                    matches!(GetParent(hwnd), Ok(p) if p == host)
+                }
+                Err(e) => return Err(format!("挂载到桌面层失败: {e}")),
+            };
+            if !attached {
+                return Err(format!(
+                    "挂载到桌面层失败: 父子关系未建立（{SETPARENT_REJECTED_MARK}）"
+                ));
+            }
             // 兜底路径 behind = Some(DefView)：把自己压到图标层正后方，保证不遮挡
             // 桌面图标；正常 WorkerW 路径 behind = None，保持默认 Z 序
             SetWindowPos(

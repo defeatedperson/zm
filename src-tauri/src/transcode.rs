@@ -324,7 +324,10 @@ fn transcode_inner(
         return Err(e);
     }
 
-    // 成功：原件移入备份目录（重名自动追加序号），优化副本原位替换
+    // 成功：原件移入备份目录（重名自动追加序号），优化副本原位替换。
+    // 备份/替换期间持有媒体文件锁——封面生成（MF 解码）可能正占用该文件，
+    // 不加锁 rename 会失败；锁在函数结束时自动释放
+    let _media_guard = crate::gallery::acquire_media_lock()?;
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Err("文件名异常".into());
     };

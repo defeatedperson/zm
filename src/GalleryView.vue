@@ -9,6 +9,7 @@ import {
   clearScreen,
   pickAndAdd,
   refresh,
+  regenThumbnail,
   removeGalleryItem,
   screenShortName,
   store,
@@ -60,6 +61,8 @@ const FPS_TIERS = [60, 30, 24];
 const optimize = reactive({
   entry: null as GalleryEntry | null,
   phase: "select" as "select" | "progress" | "done" | "error",
+  /** 修复模式：预选原始分辨率+帧率，用于重建异常素材的编码结构 */
+  repair: false,
   srcW: 0,
   srcH: 0,
   srcFps: 0,
@@ -124,29 +127,32 @@ const loadPercent = computed(() => {
   return Math.max(1, Math.round(((w * h * outFps) / src) * 100));
 });
 
-/** 是否有可执行的优化项 */
-const canOptimize = computed(
-  () => optimize.targetRes !== 0 || optimize.targetFps !== 0,
-);
+/** 是否有可执行的优化项：保持原始+原始也允许执行——重编码会重建
+ *  编码结构（关键帧/GOP），是修复异常素材的正规手段，画质无损降级最小 */
+const canOptimize = computed(() => optimize.entry !== null);
 
-function openOptimize(entry: GalleryEntry) {
+function openOptimize(entry: GalleryEntry, repair = false) {
   const meta = entry.meta;
   if (!meta) return;
   optimize.entry = entry;
+  optimize.repair = repair;
   optimize.srcW = meta.width;
   optimize.srcH = meta.height;
   optimize.srcFps =
     meta.fpsDen > 0 ? Math.round((meta.fpsNum / meta.fpsDen) * 10) / 10 : 0;
-  // 默认选「输出宽高均能覆盖最大显示器的最大降档档位」（从大到小取第一个合格项，
-  // 兼顾画质与降载；无档位或全部覆盖不了时保持原始）
-  const { w: maxW, h: maxH } = maxDisplay.value;
+  // 修复模式固定「原始+原始」；普通模式默认选「输出宽高均能覆盖最大显示器
+  // 的最大降档档位」（从大到小取第一个合格项，兼顾画质与降载；
+  // 无档位或全部覆盖不了时保持原始）
   optimize.targetRes = 0;
-  for (const o of resOptions.value) {
-    if (o.value === 0) continue;
-    const { w, h } = scaledDimsFor(o.value);
-    if (w >= maxW && h >= maxH) {
-      optimize.targetRes = o.value;
-      break;
+  if (!repair) {
+    const { w: maxW, h: maxH } = maxDisplay.value;
+    for (const o of resOptions.value) {
+      if (o.value === 0) continue;
+      const { w, h } = scaledDimsFor(o.value);
+      if (w >= maxW && h >= maxH) {
+        optimize.targetRes = o.value;
+        break;
+      }
     }
   }
   optimize.targetFps = 0;
@@ -213,6 +219,11 @@ onMounted(async () => {
     if (!optimize.entry || event.payload.path !== optimize.entry.path) return;
     if (event.payload.ok) {
       optimize.phase = "done";
+      // 修复替换了文件：旧封面的失败标记一并清除，refresh 后立即重新生成
+      const okPath = event.payload.path;
+      store.thumbFailed = new Set(
+        [...store.thumbFailed].filter((p) => p !== okPath),
+      );
       void refresh();
     } else if (event.payload.cancelled) {
       optimize.entry = null;
@@ -352,15 +363,21 @@ const thumbSrc = (entry: GalleryEntry) =>
           <span class="meta">
             {{ formatSize(entry.sizeBytes) }}
             <span v-if="entry.kind === 'image'" class="kind-tag">静态</span>
-            <span
-              v-else-if="entry.meta"
-              class="kind-tag"
-              :class="{ warn: isOverSpec(entry) }"
-              :title="isOverSpec(entry) ? '分辨率超过显示器上限，建议优化以降低资源占用' : ''"
-            >
-              {{ entry.meta.width }}×{{ entry.meta.height }}
-              <template v-if="fpsText(entry)"> · {{ fpsText(entry) }}fps</template>
-            </span>
+            <template v-else-if="entry.meta">
+              <span
+                v-if="entry.meta.kfRisk"
+                class="kind-tag risk"
+                :title="`${entry.meta.kfRisk}，直接播放会在循环时冻结。请右键 → 一键修复`"
+              >⚠ 结构异常</span>
+              <span
+                class="kind-tag"
+                :class="{ warn: isOverSpec(entry) }"
+                :title="isOverSpec(entry) ? '分辨率超过显示器上限，建议优化以降低资源占用' : ''"
+              >
+                {{ entry.meta.width }}×{{ entry.meta.height }}
+                <template v-if="fpsText(entry)"> · {{ fpsText(entry) }}fps</template>
+              </span>
+            </template>
             <span v-else class="kind-tag muted">规格探测中…</span>
           </span>
         </div>
@@ -403,6 +420,21 @@ const thumbSrc = (entry: GalleryEntry) =>
       <button
         v-if="menuEntry.kind === 'video'"
         class="menu-item"
+        @click="regenThumbnail(menuEntry.path); closeMenu()"
+      >
+        重新生成封面
+      </button>
+      <button
+        v-if="menuEntry.meta?.kfRisk"
+        class="menu-item repair"
+        :title="`${menuEntry.meta.kfRisk}。将按原始分辨率与帧率重建编码，修复后可正常应用`"
+        @click="openOptimize(menuEntry, true); closeMenu()"
+      >
+        一键修复
+      </button>
+      <button
+        v-if="menuEntry.kind === 'video'"
+        class="menu-item"
         :disabled="isInUse(menuEntry) || !menuEntry.meta"
         :title="
           isInUse(menuEntry)
@@ -430,10 +462,14 @@ const thumbSrc = (entry: GalleryEntry) =>
       @click="closeOptimize()"
     >
       <div class="optimize-dialog" @click.stop>
-        <h3>优化视频</h3>
+        <h3>{{ optimize.repair ? "修复视频" : "优化视频" }}</h3>
         <p class="opt-name" :title="optimize.entry.name">{{ optimize.entry.name }}</p>
 
         <template v-if="optimize.phase === 'select'">
+          <p v-if="optimize.repair" class="opt-warn">
+            {{ optimize.entry.meta?.kfRisk }}，直接播放会在循环时冻结。
+            将保持原始分辨率与帧率重建编码结构，完成后即可正常应用。
+          </p>
           <p class="opt-line">
             源：{{ optimize.srcW }}×{{ optimize.srcH }}
             <template v-if="optimize.srcFps"> @{{ optimize.srcFps }}fps</template>
@@ -461,7 +497,9 @@ const thumbSrc = (entry: GalleryEntry) =>
               </option>
             </select>
           </div>
-          <p v-if="!canOptimize" class="opt-note">规格已达标，无需优化。</p>
+          <p v-if="optimize.targetRes === 0 && optimize.targetFps === 0" class="opt-note">
+            保持原画质重建编码（修复结构异常 / 降低解码负载的规格不变）。
+          </p>
           <p v-else class="opt-note">
             预计解码负载降至 ~{{ loadPercent }}%，耗时取决于素材长度。
           </p>
@@ -471,7 +509,7 @@ const thumbSrc = (entry: GalleryEntry) =>
               class="primary"
               :disabled="!canOptimize"
               @click="startOptimize"
-            >开始优化</button>
+            >{{ optimize.repair ? "开始修复" : "开始优化" }}</button>
           </div>
         </template>
 
@@ -683,6 +721,36 @@ button.link:hover {
 
 .kind-tag.muted {
   opacity: 0.6;
+}
+
+/* 结构异常徽标：红底醒目，与“使用中”徽标同级别注意力 */
+.kind-tag.risk {
+  background: rgba(232, 90, 90, 0.18);
+  color: #ff8a8a;
+  font-weight: 600;
+}
+
+/* 菜单里的一键修复：强调色引导用户走修复路径 */
+.menu-item.repair {
+  color: #6fcf97;
+  font-weight: 600;
+}
+
+.menu-item.repair:hover {
+  background: rgba(111, 207, 151, 0.1);
+}
+
+/* 修复模式弹窗顶部说明 */
+.opt-warn {
+  margin: 10px 0 2px;
+  padding: 10px 12px;
+  border: 1px solid rgba(232, 90, 90, 0.4);
+  background: rgba(232, 90, 90, 0.08);
+  border-radius: 8px;
+  color: #ff9d9d;
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: left;
 }
 
 .menu-btn {

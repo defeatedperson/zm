@@ -1,16 +1,16 @@
 /// 跨视图共享的状态与操作（轻量 store，不引入 pinia）。
 import { reactive } from "vue";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getSettings } from "./settings";
 import {
   addWallpaper,
+  generateThumbnail,
   getScreens,
   listGallery,
   removeWallpaper,
-  saveThumbnail,
   setWallpaperOn,
   unsetWallpaperOn,
   type GalleryEntry,
@@ -123,6 +123,22 @@ export async function toggleUserPaused() {
   }
 }
 
+/** 手动重新生成封面（右键菜单）：清除失败标记、复位占位并重新入队。
+ *  队列串行执行；正在生成中的条目直接提示，防止重入 */
+export function regenThumbnail(path: string) {
+  if (store.generating.has(path)) {
+    setStatus("该封面正在生成中，请稍候");
+    return;
+  }
+  const entry = store.entries.find((e) => e.path === path);
+  if (entry) entry.thumbPath = null;
+  store.thumbFailed = new Set([...store.thumbFailed].filter((p) => p !== path));
+  if (!thumbQueue.includes(path)) {
+    thumbQueue.push(path);
+  }
+  void processThumbQueue();
+}
+
 /** 重新加载存储目录设置（启动与迁移完成后调用） */
 export async function loadStorageDir() {
   try {
@@ -194,6 +210,14 @@ export async function pickAndAdd() {
 // ---- 应用 / 清除 ----
 export async function applyTo(entry: GalleryEntry, label: string | null) {
   if (store.busy) return;
+  // 结构异常素材拦截：直接播放会在循环时冻结（Chromium 缺关键帧恢复点）
+  if (entry.meta?.kfRisk) {
+    setStatus(
+      `「${entry.name}」${entry.meta.kfRisk}，已阻止应用。右键该素材选「一键修复」后再使用`,
+      true,
+    );
+    return;
+  }
   store.busy = true;
   try {
     await setWallpaperOn(entry.path, label);
@@ -270,47 +294,6 @@ function enqueueThumbs() {
   void processThumbQueue();
 }
 
-function captureFrame(entry: GalleryEntry): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const video = document.createElement("video");
-    video.muted = true;
-    video.preload = "auto";
-    // 必须：asset 协议是跨域资源，不带 crossOrigin 时 canvas 会被污染，
-    // toDataURL 抛 SecurityError，表现为"无法生成封面"
-    video.crossOrigin = "anonymous";
-    const cleanup = () => {
-      video.removeAttribute("src");
-      video.load();
-    };
-    video.addEventListener("loadedmetadata", () => {
-      // 取开头 1 秒或 10% 处的帧
-      video.currentTime = Math.min(1, (video.duration || 0) * 0.1);
-    });
-    video.addEventListener("seeked", () => {
-      try {
-        const canvas = document.createElement("canvas");
-        const width = Math.min(480, video.videoWidth || 480);
-        canvas.width = width;
-        canvas.height =
-          Math.round(width * (video.videoHeight / video.videoWidth)) || 270;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("canvas 不可用");
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL("image/jpeg", 0.82));
-      } catch (err) {
-        reject(err);
-      } finally {
-        cleanup();
-      }
-    });
-    video.addEventListener("error", () => {
-      cleanup();
-      reject(new Error("视频无法解码"));
-    });
-    video.src = convertFileSrc(entry.path);
-  });
-}
-
 async function processThumbQueue() {
   if (thumbRunning) return;
   thumbRunning = true;
@@ -320,7 +303,9 @@ async function processThumbQueue() {
     if (!entry || entry.thumbPath) continue;
     store.generating = new Set(store.generating).add(path);
     try {
-      entry.thumbPath = await saveThumbnail(path, await captureFrame(entry));
+      // 后端 MF 解码截帧：Chromium 对 4K60 High@L5.2 会退软解导致
+      // seek 停滞（封面永远"生成中"），MF 管路无此问题（见 mfthumb 模块）
+      entry.thumbPath = await generateThumbnail(path);
     } catch {
       store.thumbFailed = new Set(store.thumbFailed).add(path);
     } finally {

@@ -486,6 +486,20 @@ fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), S
                 "[wallpaper] SetParent 被桌面宿主拒绝，切换 DPI-unaware 创建模式，重建壁纸窗口重试"
             );
             destroy_wallpaper_windows(app, only);
+            // 显式等待销毁完成：destroy 是投递到主线程的异步操作。当前虽然
+            // available_monitors 的同步往返 + 消息 FIFO 会隐式保序，但那依赖
+            // 框架内部实现，升级或重排即可能失效；有界等待确保重建拿到干净状态
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                let still_there = app.webview_windows().into_iter().any(|(name, _)| {
+                    name.starts_with(WALLPAPER_PREFIX)
+                        && only.map(|t| name == t).unwrap_or(true)
+                });
+                if !still_there {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             attach_wallpaper_windows_once(app, only)
         }
         other => other,
@@ -726,6 +740,13 @@ pub async fn set_wallpaper_on(
     if crate::storage::is_migrating() {
         return Err("正在迁移存储位置，请稍候".into());
     }
+    // 结构异常视频防御：这类文件（如 smart-cut 剪辑产物）在片尾没有关键帧，
+    // 直接播放数秒后管线停滞、画面冻结。前端会在画廊拦截，这里是后端兜底
+    if let Some(reason) = crate::gallery::kf_risk_of(&app, &path) {
+        return Err(format!(
+            "{reason}，直接播放会在循环时冻结。请先在画廊中右键该素材，使用「一键修复」"
+        ));
+    }
     attach_wallpaper_windows(&app, label.as_deref())?;
     let mut state = wallpaper_state().lock().map_err(|_| "状态锁异常".to_string())?;
     if let Some(l) = &label {
@@ -817,6 +838,18 @@ pub fn restore_from_settings(app: &AppHandle) {
         };
         if !std::path::Path::new(path).is_file() {
             println!("[wallpaper] 跳过 {label}：文件不存在 {path}");
+            continue;
+        }
+        // 结构异常视频：不挂载（挂上也会数秒后冻结），提示用户去画廊修复
+        if let Some(reason) = gallery::kf_risk_of(app, path) {
+            println!("[wallpaper] 跳过 {label}：{reason}（{path}）");
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            let msg = format!("已跳过「{name}」：{reason}。请在画廊中右键该素材，使用「一键修复」后再应用");
+            record_attach_error(&msg);
+            let _ = app.emit("wallpaper:attach-error", &msg);
             continue;
         }
         // 挂载（内部懒创建窗口）；页面加载完成会通过 get_wallpaper_media 拉取自己的壁纸

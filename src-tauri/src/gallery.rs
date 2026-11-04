@@ -1,7 +1,6 @@
 //! 画廊：扫描壁纸目录、添加（复制进来）、移除、封面落盘。
-//! 视频封面由前端 <video> + canvas 截帧，本模块只负责文件读写。
+//! 视频封面由后端 MF 解码生成（mfthumb 模块），图片直接用原图。
 
-use base64::Engine;
 use serde::Serialize;
 use std::fs;
 use std::io::{Read, Write};
@@ -19,7 +18,6 @@ const VIDEO_EXTS: &[&str] = &["mp4", "webm", "m4v"];
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
 /// 封面子目录（位于壁纸目录内，列表时过滤掉）
 const THUMB_DIR: &str = ".thumbs";
-const THUMB_DATA_URL_PREFIX: &str = "data:image/jpeg;base64,";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +54,14 @@ fn meta_path_for(dir: &Path, name: &str) -> PathBuf {
 fn read_meta(dir: &Path, name: &str) -> Option<probe::VideoMeta> {
     let text = fs::read_to_string(meta_path_for(dir, name)).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// 读取条目 sidecar 中的关键帧风险标记（阻止直接应用 / 启动恢复跳过用）。
+/// sidecar 缺失或旧格式无该字段时返回 None（视为无风险，不拦截）
+pub fn kf_risk_of(app: &AppHandle, path: &str) -> Option<String> {
+    let dir = settings::resolve_wallpapers_dir(app).ok()?;
+    let name = Path::new(path).file_name()?.to_str()?;
+    read_meta(&dir, name).and_then(|m| m.kf_risk)
 }
 
 /// 写入条目元数据 sidecar（转码模块替换文件后重建元数据用）
@@ -387,29 +393,48 @@ pub fn remove_wallpaper(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 前端 canvas 截帧生成的 JPEG dataURL，解码后写入封面目录，返回封面路径
+/// 媒体文件锁：封面生成（MF 解码占用源文件）与转码的「备份原件+替换」
+/// 互斥，避免 rename 与打开的文件句柄冲突导致任一方失败
+fn media_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// 转码替换文件前获取（与封面生成互斥）；返回守卫供调用方持有
+pub fn acquire_media_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    media_lock()
+        .lock()
+        .map_err(|_| "媒体文件锁异常".to_string())
+}
+
+/// 后端生成视频封面：MF 解码目标时间点的帧 → JPEG 落盘，返回封面路径。
+/// 取代旧的前端 `<video>` + canvas 截帧（Chromium 对 4K60 High@L5.2 会退
+/// 软解，seek 停滞导致封面永远生成中/黑帧，见 mfthumb 模块说明）。
+/// 必须 async + spawn_blocking：MF 解码耗时且需 COM 初始化，不能占主线程
 #[tauri::command]
-pub fn save_thumbnail(app: AppHandle, path: String, data_url: String) -> Result<String, String> {
+pub async fn generate_thumbnail(app: AppHandle, path: String) -> Result<String, String> {
     if crate::storage::is_migrating() {
         return Err("正在迁移存储位置，请稍候".into());
     }
-    let dir = settings::resolve_wallpapers_dir(&app)?;
-    let target = PathBuf::from(&path);
-    ensure_inside(&dir, &target)?;
-
-    let name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("文件名异常")?;
-    let b64 = data_url
-        .strip_prefix(THUMB_DATA_URL_PREFIX)
-        .ok_or("封面数据格式异常")?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| format!("封面数据解码失败: {e}"))?;
-
-    let thumb = thumb_path_for(&dir, name);
-    fs::create_dir_all(dir.join(THUMB_DIR)).map_err(|e| format!("创建封面目录失败: {e}"))?;
-    fs::write(&thumb, bytes).map_err(|e| format!("写入封面失败: {e}"))?;
-    Ok(thumb.to_string_lossy().into_owned())
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = settings::resolve_wallpapers_dir(&app)?;
+        let target = PathBuf::from(&path);
+        ensure_inside(&dir, &target)?;
+        let name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("文件名异常")?;
+        if !is_video(&target) {
+            return Err("仅支持视频生成封面".into());
+        }
+        let thumb = thumb_path_for(&dir, name);
+        fs::create_dir_all(dir.join(THUMB_DIR))
+            .map_err(|e| format!("创建封面目录失败: {e}"))?;
+        // 持锁生成：转码的备份/替换会等这边的解码句柄释放
+        let _guard = acquire_media_lock()?;
+        crate::mfthumb::generate(&target, &thumb)?;
+        Ok(thumb.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("封面任务调度失败: {e}"))?
 }

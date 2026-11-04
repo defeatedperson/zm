@@ -8,6 +8,8 @@ export interface VideoMeta {
   fpsNum: number;
   fpsDen: number;
   durationMs: number;
+  /** 关键帧结构风险（Some = 直接播放会冻结，需先「一键修复」重建编码） */
+  kfRisk?: string | null;
 }
 
 export interface GalleryEntry {
@@ -37,8 +39,9 @@ export const addWallpaper = (source: string) =>
 export const removeWallpaper = (path: string) =>
   invoke<void>("remove_wallpaper", { path });
 
-export const saveThumbnail = (path: string, dataUrl: string) =>
-  invoke<string>("save_thumbnail", { path, dataUrl });
+/** 后端 MF 解码生成视频封面，返回封面路径（失败抛错，由调用方标记失败） */
+export const generateThumbnail = (path: string) =>
+  invoke<string>("generate_thumbnail", { path });
 
 export const getScreens = () => invoke<ScreenInfo[]>("get_screens");
 

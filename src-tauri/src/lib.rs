@@ -1,5 +1,7 @@
 mod fullscreen;
 mod gallery;
+mod kfcheck;
+mod mfthumb;
 mod probe;
 mod settings;
 mod storage;
@@ -67,7 +69,7 @@ pub fn run() {
             gallery::list_gallery,
             gallery::add_wallpaper,
             gallery::remove_wallpaper,
-            gallery::save_thumbnail,
+            gallery::generate_thumbnail,
             transcode::optimize_start,
             transcode::optimize_cancel,
             transcode::get_backup_dir,

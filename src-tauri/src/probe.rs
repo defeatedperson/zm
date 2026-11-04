@@ -24,6 +24,11 @@ pub struct VideoMeta {
     pub fps_num: u32,
     pub fps_den: u32,
     pub duration_ms: u64,
+    /// 关键帧结构风险（Some = 直接播放会冻结，需先「视频优化」重建编码；
+    /// 见 kfcheck 模块）。旧 sidecar 无此字段，serde 默认视为无风险，
+    /// 下一次导入/优化时会自动补上
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kf_risk: Option<String>,
 }
 
 /// 进程级 MF 初始化（引用计数式，进程生命周期内不卸载）
@@ -33,12 +38,38 @@ pub fn ensure_mf_startup() -> Result<(), String> {
         .clone()
 }
 
-/// 探测视频元数据；耗时通常 <50ms，内部切换到独立线程执行
+/// 探测视频元数据（MF 规格 + 关键帧结构检测）；耗时通常 <50ms
 pub fn probe_video(path: &Path) -> Result<VideoMeta, String> {
-    let path = path.to_path_buf();
-    std::thread::spawn(move || probe_inner(&path))
+    // MP4 系容器顺带做关键帧结构检测（元数据级解析，开销可忽略）；
+    // 其余容器（webm）返回 None，不参与判定。先取扩展名再移交所有权
+    let is_mp4 = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "mp4" | "m4v" | "mov"))
+        .unwrap_or(false);
+    let owned = path.to_path_buf();
+    // join 再包一层 Result：外层 ？ 解 join，内层 ？ 解探测结果
+    let mut meta = std::thread::spawn(move || probe_inner(&owned))
         .join()
-        .map_err(|_| "探测线程崩溃".to_string())?
+        .map_err(|_| "探测线程崩溃".to_string())??;
+    if is_mp4 {
+        meta.kf_risk = crate::kfcheck::check_video(path);
+    }
+    // 极端码率检测：无损剪辑/采集流可达 200Mbps+，Chromium 播放时会退化为
+    // 软解且跟不上实时（实测表现为循环若干次后画面冻结、CPU 归零）。
+    // 转码上限 40Mbps，正常素材远低于该阈值，150Mbps 只拦极端文件
+    if meta.kf_risk.is_none() && meta.duration_ms > 0 {
+        if let Ok(len) = std::fs::metadata(path).map(|m| m.len()) {
+            let mbps = len as f64 * 8.0 / (meta.duration_ms as f64 / 1000.0) / 1e6;
+            if mbps > 150.0 {
+                meta.kf_risk = Some(format!(
+                    "码率过高（约 {:.0} Mbps），多数设备无法实时解码",
+                    mbps
+                ));
+            }
+        }
+    }
+    Ok(meta)
 }
 
 fn probe_inner(path: &PathBuf) -> Result<VideoMeta, String> {
@@ -80,13 +111,15 @@ fn probe_mf(path: &Path) -> Result<VideoMeta, String> {
             .GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)
             .map_err(|e| format!("读取媒体类型失败: {e}"))?;
 
-        // MF_MT_FRAME_SIZE: 低 32 位 = 宽，高 32 位 = 高
+        // MF_MT_FRAME_SIZE 打包：高 32 位 = 宽，低 32 位 = 高。
+        // 旧版按"低=宽"解析导致宽高颠倒（4K 横屏素材实测低 32 位为 2160），
+        // 影响 UI 显示与转码横竖屏判断；下一次探测会自动纠正 sidecar
         let size = media_type.GetUINT64(&MF_MT_FRAME_SIZE).map_err(|e| {
             println!("[probe] {} 无分辨率信息: {e}", path.display());
             e.to_string()
         })?;
-        let width = (size & 0xFFFF_FFFF) as u32;
-        let height = (size >> 32) as u32;
+        let width = (size >> 32) as u32;
+        let height = (size & 0xFFFF_FFFF) as u32;
 
         // MF_MT_FRAME_RATE: 高 32 位 = 分子，低 32 位 = 分母
         let (fps_num, fps_den) = match media_type.GetUINT64(&MF_MT_FRAME_RATE) {
@@ -108,6 +141,7 @@ fn probe_mf(path: &Path) -> Result<VideoMeta, String> {
             fps_num,
             fps_den,
             duration_ms,
+            kf_risk: None,
         })
     }
 }

@@ -39,9 +39,10 @@ export const addWallpaper = (source: string) =>
 export const removeWallpaper = (path: string) =>
   invoke<void>("remove_wallpaper", { path });
 
-/** 后端 MF 解码生成视频封面，返回封面路径（失败抛错，由调用方标记失败） */
-export const generateThumbnail = (path: string) =>
-  invoke<string>("generate_thumbnail", { path });
+/** 后端 MF 解码生成视频封面，返回封面路径（失败抛错，由调用方标记失败）。
+ *  attempt 为重新生成次数：>0 时采样点按时长比例轮换，重试换一帧 */
+export const generateThumbnail = (path: string, attempt = 0) =>
+  invoke<string>("generate_thumbnail", { path, attempt });
 
 export const getScreens = () => invoke<ScreenInfo[]>("get_screens");
 

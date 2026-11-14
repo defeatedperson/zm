@@ -1,122 +1,92 @@
 <script setup lang="ts">
-/// 应用壳层：头部导航、视图切换（画廊/设置）、底部状态栏、全局右键菜单。
-/// 业务状态与操作在 store.ts，页面内容在 GalleryView / SettingsView。
-import { onBeforeUnmount, onMounted, ref } from "vue";
-import { initApp, pickAndAdd, setStatus, store, toggleUserPaused } from "./store";
+/// 应用壳层（拆分后）：左侧竖条（AppRail）+ 右侧内容区（TitleBar + 页头 + 视图）。
+/// 业务状态与操作在 store.ts；窗口操作在 window.ts；
+/// 导入弹窗与全局右键菜单拆至 components/，页面内容在 GalleryView / SettingsView。
+import { computed, onBeforeUnmount, onMounted } from "vue";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { initWindowState } from "./window";
+import { dropFiles, initApp, NAV_ITEMS, pickAndAdd, setDragOver, store } from "./store";
+import AppRail from "./components/AppRail.vue";
+import TitleBar from "./components/TitleBar.vue";
+import ResizeHandles from "./components/ResizeHandles.vue";
+import ImportDialog from "./components/ImportDialog.vue";
+import GlobalContextMenu from "./components/GlobalContextMenu.vue";
+import DragDropOverlay from "./components/DragDropOverlay.vue";
 import GalleryView from "./GalleryView.vue";
 import SettingsView from "./SettingsView.vue";
 
-onMounted(() => {
+const current = computed(
+  () => NAV_ITEMS.find((n) => n.id === store.view) ?? NAV_ITEMS[0],
+);
+
+// 文件拖放导入：wry 在 WebView2 层拦截拖放并直接给出完整路径数组，
+// 与 HTML5 dataTransfer（拿不到本地路径）无关。enter/leave 控制遮罩，drop 落地导入
+let unlistenDrag: (() => void) | null = null;
+
+onMounted(async () => {
   void initApp();
-  document.addEventListener("contextmenu", onGlobalContextMenu);
+  initWindowState();
+  try {
+    unlistenDrag = await getCurrentWebviewWindow().onDragDropEvent((event) => {
+      const payload = event.payload;
+      if (payload.type === "enter") {
+        setDragOver(payload.paths);
+      } else if (payload.type === "leave") {
+        setDragOver(null);
+      } else if (payload.type === "drop") {
+        setDragOver(null);
+        dropFiles(payload.paths);
+      }
+      // over：仅位置更新，保持 enter 时的遮罩状态
+    });
+  } catch {
+    // 纯浏览器预览（无 Tauri IPC）时不可用，跳过
+  }
 });
 
 onBeforeUnmount(() => {
-  document.removeEventListener("contextmenu", onGlobalContextMenu);
+  unlistenDrag?.();
+  unlistenDrag = null;
 });
-
-// ---- 全局右键菜单：仅 刷新 + 复制 ----
-// 输入框内保留系统原生菜单（粘贴等）；卡片等已有自定义菜单的场景自动跳过
-const ctxMenu = ref<{ x: number; y: number; canCopy: boolean; text: string } | null>(
-  null,
-);
-
-function onGlobalContextMenu(e: MouseEvent) {
-  if (e.defaultPrevented) return;
-  const target = e.target as HTMLElement | null;
-  if (target?.closest("input, textarea, [contenteditable]")) return;
-  e.preventDefault();
-  const text = window.getSelection()?.toString() ?? "";
-  ctxMenu.value = {
-    x: Math.min(e.clientX, window.innerWidth - 170),
-    y: Math.min(e.clientY, window.innerHeight - 110),
-    canCopy: text.length > 0,
-    text,
-  };
-}
-
-function closeCtxMenu() {
-  ctxMenu.value = null;
-}
-
-async function copySelection() {
-  const menu = ctxMenu.value;
-  closeCtxMenu();
-  if (!menu?.canCopy) return;
-  try {
-    await navigator.clipboard.writeText(menu.text);
-    setStatus("已复制到剪贴板");
-  } catch (e) {
-    setStatus(`复制失败：${e}`, true);
-  }
-}
-
-function reloadApp() {
-  closeCtxMenu();
-  window.location.reload();
-}
 </script>
 
 <template>
   <main class="shell">
-    <header class="header" :class="{ constrained: store.view === 'settings' }">
-      <div>
-        <h1>{{ store.view === "gallery" ? "幻梦桌面" : "设置" }}</h1>
-        <p class="subtitle">
-          {{ store.view === "gallery" ? "点击封面应用到全部屏幕，右键卡片可指定单屏" : "存储位置与偏好设置" }}
-        </p>
-      </div>
-      <div class="actions">
-        <template v-if="store.view === 'gallery'">
-          <button class="primary" :disabled="store.busy" @click="pickAndAdd">添加素材</button>
-          <button :disabled="store.busy" @click="store.view = 'settings'">设置</button>
-        </template>
-        <button v-else @click="store.view = 'gallery'">返回画廊</button>
-      </div>
-    </header>
+    <AppRail />
 
-    <Transition name="view" mode="out-in">
-      <GalleryView v-if="store.view === 'gallery'" />
-      <SettingsView v-else />
-    </Transition>
+    <section class="content">
+      <TitleBar />
 
-    <footer class="status" :class="{ error: store.statusError }">{{ store.status }}</footer>
+      <div class="page-head" :class="{ constrained: store.view === 'settings' }">
+        <div>
+          <h1>{{ current.label }}</h1>
+          <p class="subtitle">{{ current.hint }}</p>
+        </div>
+        <div v-if="store.view === 'gallery'" class="actions">
+          <button class="primary" :disabled="store.busy" @click="pickAndAdd">
+            添加素材
+          </button>
+        </div>
+      </div>
+
+      <div class="page">
+        <Transition name="view" mode="out-in">
+          <GalleryView v-if="store.view === 'gallery'" />
+          <SettingsView v-else />
+        </Transition>
+      </div>
+    </section>
+
+    <ResizeHandles />
 
     <!-- 导入进度弹窗：导入期间不可关闭，结束后自动消失 -->
-    <div v-if="store.importing" class="import-mask">
-      <div class="import-dialog">
-        <h3>正在导入素材</h3>
-        <p class="import-name" :title="store.importName">{{ store.importName }}</p>
-        <div class="import-track">
-          <div class="import-bar" :style="{ width: `${store.importPercent}%` }" />
-        </div>
-        <p class="import-note">
-          {{ store.importPercent }}% · 第 {{ store.importCurrent }} / {{ store.importTotal }} 个文件
-        </p>
-      </div>
-    </div>
+    <ImportDialog />
+
+    <!-- 拖放导入遮罩：文件拖入窗口时提示「松开导入」 -->
+    <DragDropOverlay />
 
     <!-- 全局右键菜单：暂停 / 刷新 / 复制 -->
-    <div v-if="ctxMenu" class="ctx-overlay" @click.stop="closeCtxMenu" />
-    <div
-      v-if="ctxMenu"
-      class="ctx-menu"
-      :style="{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }"
-      @click.stop
-    >
-      <button
-        class="ctx-item"
-        :class="{ highlight: store.userPaused }"
-        @click="toggleUserPaused(); closeCtxMenu()"
-      >
-        {{ store.userPaused ? "恢复播放" : "暂停壁纸" }}
-      </button>
-      <div class="ctx-divider" />
-      <button class="ctx-item" @click="reloadApp">刷新</button>
-      <button class="ctx-item" :disabled="!ctxMenu.canCopy" @click="copySelection">
-        复制
-      </button>
-    </div>
+    <GlobalContextMenu />
   </main>
 </template>
 
@@ -124,6 +94,21 @@ function reloadApp() {
 :root {
   font-family: "Segoe UI", "Microsoft YaHei", Inter, sans-serif;
   color-scheme: dark;
+
+  /* Element Plus 主题对齐：主色与现有手写 UI 一致，
+     light-N / dark-2 供 EP 组件的 hover / active / disabled 衍生色使用 */
+  --el-color-primary: #3b6ef5;
+  --el-color-primary-light-3: #6a92f8;
+  --el-color-primary-light-5: #8fa9fa;
+  --el-color-primary-light-7: #b5c7fc;
+  --el-color-primary-light-8: #c9d6fd;
+  --el-color-primary-light-9: #dde5fe;
+  --el-color-primary-dark-2: #2f5fe0;
+  /* 弹窗观感对齐原手写弹窗 */
+  --el-dialog-bg-color: #1b1d24;
+  --el-dialog-border-radius: 12px;
+  /* 进度条轨道 */
+  --el-progress-bg-color: #14161b;
 }
 
 * {
@@ -166,30 +151,40 @@ body,
   width: 100%;
   height: 100%;
   display: flex;
-  flex-direction: column;
-  background: linear-gradient(180deg, #17181d 0%, #101116 100%);
+  background: #101116;
   color: #e8eaf0;
-  padding: 24px 28px 16px;
   overflow: hidden;
 }
 
-.header {
+/* ---- 右侧内容区 ---- */
+.content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, #17181d 0%, #101116 100%);
+}
+
+.page-head {
+  flex-shrink: 0;
+  padding: 2px 28px 0;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  flex-shrink: 0;
 }
 
-/* 设置页时头部与设置卡片同宽居中 */
-.header.constrained {
+/* 设置页标题与设置卡片同宽居中；去掉水平 padding，否则标题会比卡片缩进 */
+.page-head.constrained {
   width: 100%;
   max-width: 640px;
   margin: 0 auto;
+  padding-left: 0;
+  padding-right: 0;
 }
 
-.header h1 {
-  font-size: 22px;
+.page-head h1 {
+  font-size: 20px;
   font-weight: 600;
   letter-spacing: 1px;
 }
@@ -204,6 +199,15 @@ body,
   display: flex;
   gap: 10px;
   flex-shrink: 0;
+}
+
+.page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 28px 18px;
+  overflow: hidden;
 }
 
 button {
@@ -237,124 +241,6 @@ button.primary {
 
 button.primary:hover:not(:disabled) {
   background: #2f5fe0;
-}
-
-.status {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid #23262e;
-  color: #8a8f9c;
-  font-size: 12px;
-  flex-shrink: 0;
-}
-
-.status.error {
-  color: #f07178;
-}
-
-/* 全局右键菜单（独立类名，避免与画廊卡片菜单样式互相干扰） */
-.ctx-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 90;
-}
-
-.ctx-menu {
-  position: fixed;
-  z-index: 91;
-  min-width: 160px;
-  background: #1e2028;
-  border: 1px solid #33363f;
-  border-radius: 10px;
-  padding: 6px;
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
-  display: flex;
-  flex-direction: column;
-}
-
-.ctx-item {
-  border: none;
-  background: none;
-  text-align: left;
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 13px;
-  color: #dfe2ea;
-}
-
-.ctx-item:hover:not(:disabled) {
-  background: #2a2e38;
-}
-
-.ctx-item:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-.ctx-divider {
-  height: 1px;
-  background: #2b2e37;
-  margin: 4px 6px;
-}
-
-/* 暂停状态下高亮「恢复播放」入口 */
-.ctx-item.highlight {
-  color: #6f9bff;
-}
-
-/* 导入进度弹窗 */
-.import-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 100;
-  background: rgba(10, 11, 14, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.import-dialog {
-  width: 420px;
-  max-width: calc(100vw - 48px);
-  background: #1b1d24;
-  border: 1px solid #2b2e37;
-  border-radius: 12px;
-  padding: 20px 22px;
-}
-
-.import-dialog h3 {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.import-name {
-  margin-top: 8px;
-  font-size: 13px;
-  color: #9aa0ad;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.import-track {
-  margin-top: 14px;
-  height: 8px;
-  border-radius: 999px;
-  background: #14161b;
-  overflow: hidden;
-}
-
-.import-bar {
-  height: 100%;
-  border-radius: 999px;
-  background: #3b6ef5;
-  transition: width 0.15s ease;
-}
-
-.import-note {
-  margin-top: 10px;
-  font-size: 11px;
-  color: #6f7480;
 }
 
 /* 视图切换过渡：内容区淡入淡出 + 轻微位移 */

@@ -11,10 +11,10 @@ use tauri::{AppHandle, Emitter};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    MFCreateMediaType, MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFMediaType_Video, MFVideoInterlace_Progressive,
-    IMFMediaType, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
+    IMFMediaType, MFCreateMediaType, MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL,
+    MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READER_MEDIASOURCE,
 };
@@ -63,8 +63,9 @@ struct Plan {
 
 /// 启动优化转码（后台线程执行，进度事件广播）。
 /// target_width/height 传 0 表示保持原始分辨率；fps_num/fps_den 传 0 表示保持原始帧率。
+/// async + spawn_blocking：prepare 阶段含视频探测与文件系统操作，不占主线程。
 #[tauri::command]
-pub fn optimize_start(
+pub async fn optimize_start(
     app: AppHandle,
     path: String,
     target_width: u32,
@@ -72,17 +73,18 @@ pub fn optimize_start(
     fps_num: u32,
     fps_den: u32,
 ) -> Result<(), String> {
-    if TRANSCODING.swap(true, Ordering::AcqRel) {
-        return Err("已有优化任务进行中，请稍候".into());
-    }
-    let result = prepare_and_spawn(&app, &path, target_width, target_height, fps_num, fps_den);
-    if let Err(e) = result {
-        TRANSCODING.store(false, Ordering::Relaxed);
-        return Err(e);
-    }
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        if TRANSCODING.swap(true, Ordering::AcqRel) {
+            return Err("已有优化任务进行中，请稍候".into());
+        }
+        prepare_and_spawn(&app, &path, target_width, target_height, fps_num, fps_den)
+    })
+    .await
+    .map_err(|e| format!("优化任务调度失败: {e}"))?
 }
 
+/// 调度前的全部校验与准备。占住 TRANSCODING 后进入本函数，任何失败路径
+/// 统一在返回前复位标志（内层 prepare_inner 不碰标志，避免遗漏）。
 fn prepare_and_spawn(
     app: &AppHandle,
     path: &str,
@@ -91,8 +93,23 @@ fn prepare_and_spawn(
     fps_num: u32,
     fps_den: u32,
 ) -> Result<(), String> {
-    if crate::storage::is_migrating() {
+    let result = prepare_inner(app, path, target_width, target_height, fps_num, fps_den);
+    if let Err(e) = result {
         TRANSCODING.store(false, Ordering::Relaxed);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn prepare_inner(
+    app: &AppHandle,
+    path: &str,
+    target_width: u32,
+    target_height: u32,
+    fps_num: u32,
+    fps_den: u32,
+) -> Result<(), String> {
+    if crate::storage::is_migrating() {
         return Err("正在迁移存储位置，请稍候".into());
     }
     let dir = settings::resolve_wallpapers_dir(app)?;
@@ -105,16 +122,22 @@ fn prepare_and_spawn(
     let meta = probe::probe_video(&target)?;
 
     // 目标分辨率：0 = 原始；偶数对齐；不允许放大
-    let mut out_w = if target_width == 0 { meta.width } else { target_width };
-    let mut out_h = if target_height == 0 { meta.height } else { target_height };
+    let mut out_w = if target_width == 0 {
+        meta.width
+    } else {
+        target_width
+    };
+    let mut out_h = if target_height == 0 {
+        meta.height
+    } else {
+        target_height
+    };
     out_w -= out_w & 1;
     out_h -= out_h & 1;
     if out_w == 0 || out_h == 0 {
-        TRANSCODING.store(false, Ordering::Relaxed);
         return Err("目标分辨率无效".into());
     }
     if out_w > meta.width || out_h > meta.height {
-        TRANSCODING.store(false, Ordering::Relaxed);
         return Err("目标分辨率不能超过源视频".into());
     }
 
@@ -134,7 +157,6 @@ fn prepare_and_spawn(
     };
     let out_fps = fps_num as f64 / fps_den as f64;
     if out_fps < 12.0 {
-        TRANSCODING.store(false, Ordering::Relaxed);
         return Err("目标帧率过低".into());
     }
     let drop_frames = src_fps > 0.0 && (out_fps - src_fps).abs() > 0.5;
@@ -155,7 +177,13 @@ fn prepare_and_spawn(
     let app = app.clone();
     let path = path.to_string();
     std::thread::spawn(move || {
-        let result = run_transcode(&app, Path::new(&path), &plan, &backup_dir);
+        // panic 兜底：MF/COM 环境异常导致线程 panic 时，必须照样复位标志并
+        // 广播 done 事件——否则 TRANSCODING 卡 true，之后所有优化请求都被
+        // 「已有任务进行中」拒绝、前端进度弹窗永远停在 progress 态，只能重启
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_transcode(&app, Path::new(&path), &plan, &backup_dir)
+        }))
+        .unwrap_or_else(|_| Err("转码线程发生内部错误（panic）".into()));
         TRANSCODING.store(false, Ordering::Relaxed);
         let done = match result {
             Ok(()) => TranscodeDone {
@@ -240,7 +268,9 @@ fn transcode_inner(
             let duration_100ns = reader
                 .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
                 .ok()
-                .and_then(|pv| windows::Win32::System::Com::StructuredStorage::PropVariantToUInt64(&pv).ok())
+                .and_then(|pv| {
+                    windows::Win32::System::Com::StructuredStorage::PropVariantToUInt64(&pv).ok()
+                })
                 .unwrap_or(0);
 
             let output_type = build_output_type(plan)?;
@@ -312,8 +342,7 @@ fn transcode_inner(
                 }
             }
 
-            sink.Finalize()
-                .map_err(|e| format!("完成编码失败: {e}"))?;
+            sink.Finalize().map_err(|e| format!("完成编码失败: {e}"))?;
             println!("[transcode] 编码完成，共 {written} 帧");
         }
         Ok(())
@@ -364,7 +393,9 @@ fn transcode_inner(
 
 // ---------- MF 辅助 ----------
 
-fn create_source_reader(path: &Path) -> Result<windows::Win32::Media::MediaFoundation::IMFSourceReader, String> {
+fn create_source_reader(
+    path: &Path,
+) -> Result<windows::Win32::Media::MediaFoundation::IMFSourceReader, String> {
     let wide = wide(path);
     unsafe {
         MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), None)
@@ -381,7 +412,10 @@ fn build_output_type(plan: &Plan) -> Result<IMFMediaType, String> {
             .map_err(|e| e.to_string())?;
         t.SetUINT64(
             &MF_MT_FRAME_SIZE,
-            ((plan.out_h as u64) << 32) | plan.out_w as u64,
+            // 打包：高 32 位 = 宽，低 32 位 = 高（官方文档，与 probe/mfthumb 的解析一致）。
+            // 曾把 out_h 放在高 32 位导致输出文件宽高互换——横屏素材优化后变成
+            // 竖屏文件、画面错位成中心一小块（用户实测），勿再颠倒
+            ((plan.out_w as u64) << 32) | plan.out_h as u64,
         )
         .map_err(|e| e.to_string())?;
         t.SetUINT64(
@@ -389,10 +423,12 @@ fn build_output_type(plan: &Plan) -> Result<IMFMediaType, String> {
             ((plan.fps_num as u64) << 32) | plan.fps_den as u64,
         )
         .map_err(|e| e.to_string())?;
-        t.SetUINT32(&MF_MT_AVG_BITRATE, plan.bitrate).map_err(|e| e.to_string())?;
+        t.SetUINT32(&MF_MT_AVG_BITRATE, plan.bitrate)
+            .map_err(|e| e.to_string())?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
             .map_err(|e| e.to_string())?;
-        t.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1).map_err(|e| e.to_string())?;
+        t.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)
+            .map_err(|e| e.to_string())?;
         Ok(t)
     }
 }
@@ -406,12 +442,38 @@ fn wide(path: &Path) -> Vec<u16> {
 
 // ---------- 文件与目录 ----------
 
+/// 转码临时输出后缀（保留 .mp4 结尾：MF 按扩展名选择 MP4 sink）。
+/// 后缀足够独特，不会与用户文件重名；画廊列表会跳过它（见 gallery），
+/// 启动时 cleanup_temp_files 清理被中断转码留下的半成品——
+/// 否则强杀进程后残留文件会以"坏卡片"形态混进画廊
+pub(crate) const TEMP_EXT: &str = ".livepaper-tmp.mp4";
+
 fn temp_output_path(path: &Path) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("video");
-    path.with_file_name(format!("{stem}.tmp.mp4"))
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+    path.with_file_name(format!("{stem}{TEMP_EXT}"))
+}
+
+/// 清理被中断转码残留的临时文件。只在启动恢复后调用（此时不可能
+/// 有转码在跑，删除不会误伤进行中的任务）；失败的条目留在原地，
+/// 画廊过滤兜底，不影响使用
+pub fn cleanup_temp_files(app: &AppHandle) {
+    let Ok(dir) = settings::resolve_wallpapers_dir(app) else {
+        return;
+    };
+    let Ok(items) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut removed = 0;
+    for item in items.flatten() {
+        if item.file_name().to_string_lossy().ends_with(TEMP_EXT)
+            && std::fs::remove_file(item.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        println!("[transcode] 已清理 {removed} 个中断转码的临时文件");
+    }
 }
 
 /// 备份目录：自定义存储根目录（未配置时为默认位置）下的 backup，由 settings 统一解析
@@ -442,11 +504,14 @@ fn dedupe_backup_path(backup_dir: &Path, name: &str) -> PathBuf {
     backup_dir.join(format!("{stem}-backup{ext}"))
 }
 
-/// 查询备份目录路径（设置页「打开备份目录」用）
+/// 查询备份目录路径（设置页「打开备份目录」用）。
+/// async + spawn_blocking：解析会读设置并按需创建目录，不占主线程
 #[tauri::command]
-pub fn get_backup_dir(app: AppHandle) -> Result<String, String> {
-    let dir = backup_dir(&app)?;
-    Ok(dir.to_string_lossy().into_owned())
+pub async fn get_backup_dir(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backup_dir(&app))
+        .await
+        .map_err(|e| format!("查询备份目录失败: {e}"))?
+        .map(|dir| dir.to_string_lossy().into_owned())
 }
 
 /// 取消当前转码

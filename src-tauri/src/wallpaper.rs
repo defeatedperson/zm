@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, Monitor, WebviewUrl, WebviewWindowBuilder};
@@ -7,21 +7,21 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, HWND, LPARAM, POINT, RECT, WIN32_ERROR, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CreateRectRgn, EnumDisplayDevicesW, RedrawWindow, SetWindowRgn,
+    DISPLAY_DEVICEW, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
     DPI_AWARENESS_CONTEXT_UNAWARE,
 };
-use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateRectRgn, RedrawWindow, SetWindowRgn, RDW_ALLCHILDREN, RDW_ERASE,
-    RDW_INVALIDATE, RDW_UPDATENOW,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, FindWindowW, GetClassNameW, GetClientRect, GetParent, GetWindow,
     GetWindowLongPtrW, GetWindowRect, SendMessageTimeoutW, SetParent, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT,
-    SMTO_ABORTIFHUNG, SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_POPUP,
-    WS_THICKFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, SMTO_ABORTIFHUNG,
+    SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
+    WS_EX_WINDOWEDGE, WS_POPUP, WS_THICKFRAME,
 };
 
 use crate::gallery;
@@ -50,7 +50,8 @@ const WALLPAPER_PREFIX: &str = "wallpaper-";
 ///
 /// 前面几项是 wry 的默认值，`additional_browser_args` 会整体覆盖它，
 /// 因此必须一并带上；`--autoplay-policy` 同理（wry 原本会自动追加）。
-pub(crate) const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
+pub(crate) const BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
 CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required";
 
 /// 启动恢复是否已完成（get_screens 需等待它，避免把恢复中间态返回给前端）
@@ -80,9 +81,11 @@ pub fn apply_user_paused(app: &AppHandle, paused: bool) -> Result<(), String> {
     app.emit("wallpaper:user-paused", paused)
         .map_err(|e| format!("发送暂停事件失败: {e}"))?;
     if let Some(tray) = app.try_state::<crate::TrayMenus>() {
-        let _ = tray
-            .pause_item
-            .set_text(if paused { "恢复播放" } else { "暂停壁纸" });
+        let _ = tray.pause_item.set_text(if paused {
+            "恢复播放"
+        } else {
+            "暂停壁纸"
+        });
     }
     Ok(())
 }
@@ -165,15 +168,70 @@ pub struct ScreenInfo {
 
 pub fn monitor_label(m: &Monitor, index: usize) -> String {
     if let Some(name) = m.name() {
-        let cleaned: String = name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        if !cleaned.is_empty() {
-            return format!("{WALLPAPER_PREFIX}{cleaned}");
+        // 优先硬件稳定标识：\\.\DISPLAYn 的编号是枚举序，显示器集合变化
+        // （换接口/扩展坞/驱动更新）后可能重排，用它做持久化 key 会让
+        // 壁纸分配在重启后落到错误的物理屏
+        if let Some(hw) = unsafe { monitor_hw_id(name) } {
+            return format!("{WALLPAPER_PREFIX}{hw}");
+        }
+        // 兜底：拿不到硬件 ID（部分虚拟显示器等）沿用设备名清洗规则
+        if let Some(legacy) = legacy_label_from_name(name) {
+            return legacy;
         }
     }
     format!("{WALLPAPER_PREFIX}{index}")
+}
+
+/// 旧版 label 规则（v0.2.6 及之前）：清洗设备名得到 wallpaper-DISPLAYn。
+/// 仅用于启动时读取旧配置里的壁纸分配并迁移到新 key，勿用于新写入
+fn legacy_label_from_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!cleaned.is_empty()).then(|| format!("{WALLPAPER_PREFIX}{cleaned}"))
+}
+
+/// Rust 字符串 → NUL 结尾 UTF-16（Win32 调用前构造，缓冲区须存活于调用期间）
+fn wide_str(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 查显示器的硬件稳定标识。device_name 为 tauri Monitor::name()（\\.\DISPLAYn），
+/// EnumDisplayDevices 二段枚举拿到该显示器 MONITOR 设备，其 DeviceID 形如
+/// `MONITOR\AUS27D2B\{4d36e96e-…}\0002`：中段是 EDID 厂商+型号+序列哈希，
+/// 尾段是设备实例号（区分同型号多屏/不同接口），两者都不随枚举顺序变化。
+/// 取「EDID 标识-实例号」两段拼合（如 AUS27D2B-0002），保持日志与配置可读。
+/// 查不到（虚拟显示器/RDP 会话等）返回 None，调用方走兜底规则。
+unsafe fn monitor_hw_id(device_name: &str) -> Option<String> {
+    let name_w = wide_str(device_name);
+    let mut dd = DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    let ok = EnumDisplayDevicesW(PCWSTR(name_w.as_ptr()), 0, &mut dd, 0);
+    if !ok.as_bool()
+        || dd.StateFlags.0 & windows::Win32::Graphics::Gdi::DISPLAY_DEVICE_ACTIVE.0 == 0
+    {
+        return None;
+    }
+    let id = String::from_utf16_lossy(&dd.DeviceID)
+        .trim_end_matches('\0')
+        .to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = id.split('\\').collect();
+    let key = if parts.len() >= 4 {
+        format!("{}-{}", parts[1], parts[parts.len() - 1])
+    } else {
+        id
+    };
+    let cleaned: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// 枚举显示器。
@@ -203,19 +261,15 @@ fn ensure_window(app: &AppHandle, label: &str, m: &Monitor) -> Result<(), String
     let y = m.position().y as f64 / scale;
     let w = m.size().width as f64 / scale;
     let h = m.size().height as f64 / scale;
-    let builder = WebviewWindowBuilder::new(
-        app,
-        label,
-        WebviewUrl::App("wallpaper.html".into()),
-    )
-    .title("LivePaper Wallpaper")
-    .decorations(false)
-    .resizable(false)
-    .skip_taskbar(true)
-    .visible(false)
-    .additional_browser_args(BROWSER_ARGS)
-    .position(x, y)
-    .inner_size(w, h);
+    let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("wallpaper.html".into()))
+        .title("LivePaper Wallpaper")
+        .decorations(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .visible(false)
+        .additional_browser_args(BROWSER_ARGS)
+        .position(x, y)
+        .inner_size(w, h);
     let built = if WALLPAPER_DPI_UNAWARE.load(Ordering::Relaxed) {
         // H1 兼容模式：以 DPI-unaware 上下文创建壁纸窗口。
         // 窗口的 DPI 上下文在创建瞬间取自创建线程；事件循环线程平时是
@@ -283,7 +337,7 @@ unsafe fn force_fill_children(hwnd: HWND, width: i32, height: i32) {
 /// 该文案会透传到主窗口底部状态栏（红字），面向普通用户而非开发者。
 fn attach_unavailable(reason: &str) -> String {
     format!(
-        "{reason}，已停止挂载动态壁纸（可能与 Wallpaper Engine 等壁纸软件冲突，或 explorer 刚重启）。\
+        "{reason}，已停止挂载桌面壁纸（可能与 Wallpaper Engine 等壁纸软件冲突，或 explorer 刚重启）。\
          请完全退出其他壁纸软件后重试；若仍失败，请重启资源管理器（explorer）后再试"
     )
 }
@@ -384,8 +438,7 @@ unsafe fn locate_host_layer(progman: HWND) -> Result<(HWND, Option<HWND>), Strin
     // 因此逐一检查类名直到遇到真正的 WorkerW
     let mut after = Some(defview);
     for _ in 0..16 {
-        let Ok(next) =
-            FindWindowExW(Some(defview_host), after, PCWSTR::null(), PCWSTR::null())
+        let Ok(next) = FindWindowExW(Some(defview_host), after, PCWSTR::null(), PCWSTR::null())
         else {
             break;
         };
@@ -425,13 +478,11 @@ unsafe fn fallback_behind_defview(progman: HWND) -> Result<(HWND, Option<HWND>),
          若 explorer 正在重建桌面，请稍后重试）"
             .to_string()
     })?;
-    let defview =
-        FindWindowExW(Some(host), None, w!("SHELLDLL_DefView"), PCWSTR::null())
-            .map_err(|_| "定位桌面图标层失败，请稍后重试".to_string())?;
+    let defview = FindWindowExW(Some(host), None, w!("SHELLDLL_DefView"), PCWSTR::null())
+        .map_err(|_| "定位桌面图标层失败，请稍后重试".to_string())?;
     println!(
         "[wallpaper] 兜底挂载：宿主 hwnd={:#x}，DefView hwnd={:#x}",
-        host.0 as usize,
-        defview.0 as usize
+        host.0 as usize, defview.0 as usize
     );
     Ok((host, Some(defview)))
 }
@@ -473,10 +524,29 @@ fn wait_hwnd(win: &tauri::WebviewWindow, label: &str) -> Result<HWND, String> {
     Err(format!("等待窗口句柄超时: {label}"))
 }
 
-/// 挂载入口：先按正常流程执行一次；若 SetParent 被桌面宿主以 DPI 上下文
+/// 桌面挂载操作互斥锁：attach 是「WorkerW 探测 → 懒建窗 → SetParent →
+/// 贴合矩形」一长串有状态步骤，用户应用壁纸、启动恢复与热插拔重排
+/// 并发进入会互相踩（如两边同时懒创建同一块屏的窗口，后者报 label
+/// 已存在）。锁中毒用 into_inner 恢复：挂载路径不 panic，即使历史
+/// panic 也不该让后续所有挂载永久失败（与 settings::lock_guard 同款）
+fn desktop_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 挂载入口（加锁串行化）。DPI 兼容重试见 attach_with_dpi_retry。
+fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
+    let _guard = desktop_lock();
+    attach_with_dpi_retry(app, only)
+}
+
+/// 先按正常流程执行一次；若 SetParent 被桌面宿主以 DPI 上下文
 /// 不兼容为由拒绝（部分 Win11 24H2 机器，见 build_wallpaper_window_unaware），
 /// 则销毁壁纸窗口、切换 DPI-unaware 创建模式后整体重试一次。
-fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
+/// 调用方须已持有 desktop_lock（经 attach_wallpaper_windows 进入）。
+fn attach_with_dpi_retry(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
     match attach_wallpaper_windows_once(app, only) {
         Err(e)
             if e.contains(SETPARENT_REJECTED_MARK)
@@ -492,8 +562,7 @@ fn attach_wallpaper_windows(app: &AppHandle, only: Option<&str>) -> Result<(), S
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
                 let still_there = app.webview_windows().into_iter().any(|(name, _)| {
-                    name.starts_with(WALLPAPER_PREFIX)
-                        && only.map(|t| name == t).unwrap_or(true)
+                    name.starts_with(WALLPAPER_PREFIX) && only.map(|t| name == t).unwrap_or(true)
                 });
                 if !still_there {
                     break;
@@ -527,7 +596,10 @@ fn destroy_wallpaper_windows(app: &AppHandle, only: Option<&str>) {
 /// 每屏一个窗口、窗口内铺满视口，因此天然规避跨屏 DPI 换算误差。
 /// `only` 传入时只挂载标签匹配的那块屏（单屏应用壁纸）。
 fn attach_wallpaper_windows_once(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
-    println!("[wallpaper] attach v4 (force-fill + fallback){}", only.map(|l| format!(" [{l}]")).unwrap_or_default());
+    println!(
+        "[wallpaper] attach v4 (force-fill + fallback){}",
+        only.map(|l| format!(" [{l}]")).unwrap_or_default()
+    );
     unsafe {
         let (host, behind) = find_or_spawn_workerw()?;
         let mut host_rect = RECT::default();
@@ -566,8 +638,8 @@ fn attach_wallpaper_windows_once(app: &AppHandle, only: Option<&str>) -> Result<
             // 作为子窗口时 tao 的"抹边框"消息处理不再生效，系统会按残留
             // 样式算出约 8px 非客户区，WebView 只能铺到客户区、四周露边
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as usize;
-            let frames = (WS_POPUP.0 | WS_CAPTION.0 | WS_THICKFRAME.0 | WS_BORDER.0
-                | WS_DLGFRAME.0) as usize;
+            let frames = (WS_POPUP.0 | WS_CAPTION.0 | WS_THICKFRAME.0 | WS_BORDER.0 | WS_DLGFRAME.0)
+                as usize;
             let new_style = (style & !frames) | WS_CHILD.0 as usize;
             SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
 
@@ -644,11 +716,7 @@ fn attach_wallpaper_windows_once(app: &AppHandle, only: Option<&str>) -> Result<
                 after.left, after.top, after.right, after.bottom
             );
             // 强制 WebView2 各层宿主铺满客户区（= 显示器矩形）
-            force_fill_children(
-                hwnd,
-                m.size().width as i32,
-                m.size().height as i32,
-            );
+            force_fill_children(hwnd, m.size().width as i32, m.size().height as i32);
 
             // 把窗口可见区域裁剪为客户区：补偿产生的外沿会伸进相邻屏幕，
             // 压住邻居壁纸窗口的边缘像素（表现为邻屏边缘的细线/空条）。
@@ -748,7 +816,9 @@ pub async fn set_wallpaper_on(
         ));
     }
     attach_wallpaper_windows(&app, label.as_deref())?;
-    let mut state = wallpaper_state().lock().map_err(|_| "状态锁异常".to_string())?;
+    let mut state = wallpaper_state()
+        .lock()
+        .map_err(|_| "状态锁异常".to_string())?;
     if let Some(l) = &label {
         set_video_on_window(&app, l, path.clone())?;
         state.insert(l.clone(), path.clone());
@@ -789,7 +859,7 @@ pub async fn reapply_last(app: &AppHandle) -> Result<(), String> {
         .map_err(|_| "状态锁异常".to_string())?
         .clone()
     else {
-        return Err("本次运行尚未设置过动态壁纸".into());
+        return Err("本次运行尚未设置过桌面壁纸".into());
     };
     set_wallpaper_on(app.clone(), path, None).await
 }
@@ -806,6 +876,8 @@ pub fn start_restore(app: AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         restore_from_settings(&app);
         RESTORE_DONE.store(true, Ordering::Release);
+        // 清理被中断转码残留的临时文件（早于任何新转码启动）
+        crate::transcode::cleanup_temp_files(&app);
         // 存量视频的元数据回填（缺 sidecar 的补探测），完成后广播刷新
         gallery::backfill_meta(&app);
     });
@@ -833,21 +905,38 @@ pub fn restore_from_settings(app: &AppHandle) {
     };
     for (i, m) in monitors.iter().enumerate() {
         let label = monitor_label(m, i);
-        let Some(path) = settings.wallpaper_assignments.get(&label) else {
+        let mut path = settings.wallpaper_assignments.get(&label).cloned();
+        if path.is_none() {
+            // v0.2.6 及之前用 DISPLAYn 序号做 key：升级后首次启动把旧分配
+            // 迁移到新硬件标识 key，避免用户的壁纸分配静默丢失
+            if let Some(legacy) = m.name().and_then(|n| legacy_label_from_name(n)) {
+                if let Some(p) = settings.wallpaper_assignments.get(&legacy).cloned() {
+                    settings::update_assignments(app, |map| {
+                        map.remove(&legacy);
+                        map.insert(label.clone(), p.clone());
+                    });
+                    println!("[wallpaper] 分配 key 迁移：{legacy} → {label}");
+                    path = Some(p);
+                }
+            }
+        }
+        let Some(path) = path else {
             continue;
         };
-        if !std::path::Path::new(path).is_file() {
+        if !std::path::Path::new(&path).is_file() {
             println!("[wallpaper] 跳过 {label}：文件不存在 {path}");
             continue;
         }
         // 结构异常视频：不挂载（挂上也会数秒后冻结），提示用户去画廊修复
-        if let Some(reason) = gallery::kf_risk_of(app, path) {
+        if let Some(reason) = gallery::kf_risk_of(app, &path) {
             println!("[wallpaper] 跳过 {label}：{reason}（{path}）");
-            let name = std::path::Path::new(path)
+            let name = std::path::Path::new(&path)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(path);
-            let msg = format!("已跳过「{name}」：{reason}。请在画廊中右键该素材，使用「一键修复」后再应用");
+                .unwrap_or(&path);
+            let msg = format!(
+                "已跳过「{name}」：{reason}。请在画廊中右键该素材，使用「一键修复」后再应用"
+            );
             record_attach_error(&msg);
             let _ = app.emit("wallpaper:attach-error", &msg);
             continue;
@@ -855,7 +944,7 @@ pub fn restore_from_settings(app: &AppHandle) {
         // 挂载（内部懒创建窗口）；页面加载完成会通过 get_wallpaper_media 拉取自己的壁纸
         if let Err(e) = attach_wallpaper_windows(app, Some(&label)) {
             println!("[wallpaper] 恢复 {label} 挂载失败: {e}");
-            let msg = format!("启动恢复动态壁纸失败：{e}");
+            let msg = format!("启动恢复桌面壁纸失败：{e}");
             record_attach_error(&msg);
             // 后台线程静默失败用户无从感知，广播给主窗口状态栏红字提示
             let _ = app.emit("wallpaper:attach-error", &msg);
@@ -875,6 +964,153 @@ pub fn restore_from_settings(app: &AppHandle) {
     if let (Some(p), Ok(mut last)) = (last_path, last_wallpaper().lock()) {
         *last = Some(p);
     }
+}
+
+// ---- 显示器热插拔 / 布局变化监视 ----
+
+/// 一份显示器配置快照：(label, x, y, w, h)，按 label 排序后比较
+type DisplayState = Vec<(String, i32, i32, u32, u32)>;
+
+struct DisplayWatch {
+    /// 最近一次观测到的配置（轮询每 2s 刷新一次）
+    current: DisplayState,
+    /// 配置已连续稳定的轮数（模式切换/布局拖动期间会反复抖动，等它停）
+    stable_ticks: u32,
+    /// 已应用（建窗/重排/销毁）过的配置；稳定后与 current 不同才行动
+    applied: Option<DisplayState>,
+}
+
+fn display_watch_state() -> &'static Mutex<Option<DisplayWatch>> {
+    static STATE: OnceLock<Mutex<Option<DisplayWatch>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn display_state_of(monitors: &[Monitor]) -> DisplayState {
+    let mut v: DisplayState = monitors
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let size = m.size();
+            (
+                monitor_label(m, i),
+                m.position().x,
+                m.position().y,
+                size.width,
+                size.height,
+            )
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// 每轮全屏检测时顺带调用（复用同一份显示器枚举，不另起线程）。
+/// 显示器集合或布局变化后，等配置连续 2 轮稳定再重排壁纸窗口：
+///
+/// - 新插入且配置里有分配的屏：自动挂载并补发媒体（复用启动恢复的校验）
+/// - 消失的屏：卸载并销毁窗口（分配保留在配置里，重新插入自动恢复）
+/// - 位置/尺寸变化的屏：重新贴合矩形（不打断正在播放的视频）
+///
+/// 行动后无论成败都记录 applied，避免每 2 秒重试风暴；失败原因见日志。
+/// attach 内部有 desktop_lock，与用户同时点「应用」串行化
+pub fn handle_display_change(app: &AppHandle, monitors: &[Monitor]) {
+    // 启动恢复未完成时不介入：基线尚未就绪，重排会与恢复流程互相踩
+    if !RESTORE_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    let observed = display_state_of(monitors);
+    // 空列表视为瞬态（驱动重置/切换中）直接忽略：不动基线也不行动，
+    // 等它回来——若与之前一致则什么都不发生；真把全部窗口销毁掉，恢复
+    // 时视频要整个重启（可见闪烁），代价远大于等待
+    if observed.is_empty() {
+        return;
+    }
+    // 临界区内只更新判定状态，窗口操作全部放在锁外
+    let act = {
+        let mut watch = match display_watch_state().lock() {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let watch = watch.get_or_insert_with(|| DisplayWatch {
+            current: observed.clone(),
+            stable_ticks: 0,
+            // 首次观测视为已应用：启动恢复刚跑完，现状就是目标状态
+            applied: Some(observed.clone()),
+        });
+        if watch.current != observed {
+            watch.current = observed.clone();
+            watch.stable_ticks = 0;
+            false
+        } else {
+            watch.stable_ticks = watch.stable_ticks.saturating_add(1);
+            watch.stable_ticks >= 2 && watch.applied.as_deref() != Some(&observed)
+        }
+    };
+    if !act {
+        return;
+    }
+    println!("[wallpaper] 显示器配置已变化并稳定，重排壁纸窗口");
+
+    // 1) 消失的屏：卸载销毁（不走 attach 的锁——销毁与挂载不会争夺同一资源）
+    let labels_now: HashSet<String> = observed.iter().map(|(l, ..)| l.clone()).collect();
+    let orphaned: Vec<String> = app
+        .webview_windows()
+        .keys()
+        .filter(|l| l.starts_with(WALLPAPER_PREFIX) && !labels_now.contains(*l))
+        .cloned()
+        .collect();
+    for label in &orphaned {
+        let _ = detach_wallpaper_windows(app, Some(label));
+        if let Some(win) = app.get_webview_window(label) {
+            let _ = win.destroy();
+        }
+        if let Ok(mut state) = wallpaper_state().lock() {
+            state.remove(label);
+        }
+        println!("[wallpaper] 显示器已移除，销毁其壁纸窗口：{label}");
+    }
+
+    // 2) 逐屏对齐：有分配的屏挂载/重贴；无分配的闲置屏不建窗
+    let assignments = settings::load(app).wallpaper_assignments;
+    for (label, _, _, _, _) in &observed {
+        let Some(path) = assignments.get(label) else {
+            continue;
+        };
+        if !std::path::Path::new(path).is_file() {
+            continue;
+        }
+        // 与启动恢复同一套结构异常拦截（挂上也会数秒后冻结）
+        if let Some(reason) = gallery::kf_risk_of(app, path) {
+            println!("[wallpaper] 热插拔恢复跳过 {label}：{reason}");
+            continue;
+        }
+        let playing = wallpaper_state()
+            .lock()
+            .map(|s| s.contains_key(label))
+            .unwrap_or(false);
+        if let Err(e) = attach_wallpaper_windows(app, Some(label)) {
+            println!("[wallpaper] 热插拔重排 {label} 失败: {e}");
+            continue;
+        }
+        if !playing {
+            // 新挂载的窗口补发媒体；已存在的只被重新定位，不打断播放
+            if let Err(e) = set_video_on_window(app, label, path.clone()) {
+                println!("[wallpaper] 热插拔补发媒体失败 {label}: {e}");
+                continue;
+            }
+            if let Ok(mut state) = wallpaper_state().lock() {
+                state.insert(label.clone(), path.clone());
+            }
+        }
+    }
+
+    // 3) 记录已应用状态，并让主窗口刷新屏幕列表（使用中徽标等同步更新）
+    if let Ok(mut watch) = display_watch_state().lock() {
+        if let Some(w) = watch.as_mut() {
+            w.applied = Some(observed);
+        }
+    }
+    let _ = app.emit("wallpaper:screens-changed", ());
 }
 
 /// 壁纸页面就绪后拉取本屏的媒体分配（懒创建窗口时 emit 会早于页面监听注册而丢失）。
@@ -921,7 +1157,9 @@ pub fn set_user_paused(app: AppHandle, paused: bool) -> Result<(), String> {
 /// 清除后销毁对应窗口：闲置屏不再保留 webview（内存优化）。
 #[tauri::command]
 pub async fn unset_wallpaper_on(app: AppHandle, label: Option<String>) -> Result<(), String> {
-    let mut state = wallpaper_state().lock().map_err(|_| "状态锁异常".to_string())?;
+    let mut state = wallpaper_state()
+        .lock()
+        .map_err(|_| "状态锁异常".to_string())?;
     if let Some(l) = &label {
         let _ = app.emit_to(l, "wallpaper:clear", ());
         state.remove(l);
@@ -979,13 +1217,18 @@ pub async fn get_screens(app: AppHandle) -> Result<Vec<ScreenInfo>, String> {
 }
 
 fn build_screens(app: &AppHandle) -> Result<Vec<ScreenInfo>, String> {
-    let state = wallpaper_state().lock().map_err(|_| "状态锁异常".to_string())?;
+    let state = wallpaper_state()
+        .lock()
+        .map_err(|_| "状态锁异常".to_string())?;
     let mut out = Vec::new();
     for (i, m) in list_monitors(app)?.iter().enumerate() {
         let label = monitor_label(m, i);
         let size = m.size();
         out.push(ScreenInfo {
-            name: m.name().map(|s| s.to_string()).unwrap_or_else(|| format!("显示器 {}", i + 1)),
+            name: m
+                .name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("显示器 {}", i + 1)),
             wallpaper_path: state.get(&label).cloned(),
             label,
             width: size.width,

@@ -48,10 +48,7 @@ struct MigrateProgress {
 /// 更改存储位置（整体迁移 wallpapers + backup，需先关闭所有壁纸）。
 /// 复制耗时可能较长，放阻塞线程执行，进度以 100ms 节流广播。
 #[tauri::command]
-pub async fn migrate_storage(
-    app: AppHandle,
-    new_root: String,
-) -> Result<MigrationResult, String> {
+pub async fn migrate_storage(app: AppHandle, new_root: String) -> Result<MigrationResult, String> {
     tauri::async_runtime::spawn_blocking(move || migrate_blocking(&app, &new_root))
         .await
         .map_err(|e| format!("迁移任务调度失败: {e}"))?
@@ -77,7 +74,7 @@ fn migrate_inner(app: &AppHandle, new_root: &str) -> Result<MigrationResult, Str
 
     // —— 前置状态检查：壁纸已关闭、无导入/转码进行中 ——
     if wallpaper::any_active(app) {
-        return Err("请先关闭所有屏幕的动态壁纸，再更改存储位置".into());
+        return Err("请先关闭所有屏幕的桌面壁纸，再更改存储位置".into());
     }
     if transcode::is_transcoding() {
         return Err("正在优化视频，请等待完成后再更改存储位置".into());
@@ -168,7 +165,9 @@ fn migrate_inner(app: &AppHandle, new_root: &str) -> Result<MigrationResult, Str
     if let Err(e) = verify {
         let _ = fs::remove_dir_all(&new_wallpapers);
         let _ = fs::remove_dir_all(&new_backup);
-        return Err(format!("复制结果与原目录不一致（{e}）。已中止，原目录未做任何改动"));
+        return Err(format!(
+            "复制结果与原目录不一致（{e}）。已中止，原目录未做任何改动"
+        ));
     }
 
     // —— 切换配置（原子写 settings.json）并放开新位置的访问范围 ——
@@ -204,34 +203,36 @@ fn migrate_inner(app: &AppHandle, new_root: &str) -> Result<MigrationResult, Str
 /// 一键清理默认存储位置的 wallpapers 与 backup 残留。
 /// 仅在自定义位置「实际生效」时允许——若自定义位置的磁盘未接入（已回退默认），
 /// 默认目录正是当前正在使用的数据，必须拒绝。
+/// async + spawn_blocking：递归删除大目录耗时，不占主线程
 #[tauri::command]
-pub fn delete_default_dirs(app: AppHandle) -> Result<(), String> {
-    if !settings::using_custom_root(&app) {
-        return Err(
-            "当前实际使用的是默认存储位置（未配置自定义位置，或其磁盘未接入），不能清理".into(),
-        );
-    }
-    if MIGRATING.load(Ordering::Relaxed) {
-        return Err("正在迁移存储位置，请稍候".into());
-    }
-    let base = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|e| e.to_string())?;
-    let mut errors = Vec::new();
-    for name in ["wallpapers", "backup"] {
-        let dir = base.join(name);
-        if dir.exists() {
-            if let Err(e) = fs::remove_dir_all(&dir) {
-                errors.push(format!("{}：{e}", dir.display()));
+pub async fn delete_default_dirs(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !settings::using_custom_root(&app) {
+            return Err(
+                "当前实际使用的是默认存储位置（未配置自定义位置，或其磁盘未接入），不能清理".into(),
+            );
+        }
+        if MIGRATING.load(Ordering::Relaxed) {
+            return Err("正在迁移存储位置，请稍候".into());
+        }
+        let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let mut errors = Vec::new();
+        for name in ["wallpapers", "backup"] {
+            let dir = base.join(name);
+            if dir.exists() {
+                if let Err(e) = fs::remove_dir_all(&dir) {
+                    errors.push(format!("{}：{e}", dir.display()));
+                }
             }
         }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("部分目录删除失败：{}", errors.join("；")))
-    }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("部分目录删除失败：{}", errors.join("；")))
+        }
+    })
+    .await
+    .map_err(|e| format!("清理任务调度失败: {e}"))?
 }
 
 /// 把自定义存储根目录加入 asset 协议运行时白名单（前端 convertFileSrc 才能加载
@@ -328,9 +329,7 @@ fn copy_tree(ctx: &mut CopyCtx, src: &Path, dst: &Path) -> Result<(), String> {
             copy_tree(ctx, &path, &target)?;
         } else {
             let len = item.metadata().map(|m| m.len()).unwrap_or(0);
-            fs::copy(&path, &target).map_err(|e| {
-                format!("复制 {} 失败: {e}", path.display())
-            })?;
+            fs::copy(&path, &target).map_err(|e| format!("复制 {} 失败: {e}", path.display()))?;
             ctx.copied += len;
             if ctx.last_emit.elapsed() >= Duration::from_millis(100) {
                 let _ = ctx.app.emit(

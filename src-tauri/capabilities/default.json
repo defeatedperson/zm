@@ -9,6 +9,11 @@
     "dialog:default",
     "autostart:allow-is-enabled",
     "autostart:allow-enable",
-    "autostart:allow-disable"
+    "autostart:allow-disable",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging"
   ]
 }

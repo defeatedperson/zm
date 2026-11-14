@@ -1,5 +1,6 @@
 <script setup lang="ts">
-/// 设置页：存储位置、开机自启、关于（后续设置项继续往这里加区块）。
+/// 设置页（拆分后）：存储位置、开机自启、全屏暂停、关于。
+/// 卡片壳与开关行拆至 components/settings/；开关用 ElSwitch、迁移进度用 ElProgress。
 import { onMounted, onUnmounted, ref } from "vue";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { ask, open } from "@tauri-apps/plugin-dialog";
@@ -20,6 +21,8 @@ import {
   setFullscreenPause,
   type SettingsView,
 } from "./settings";
+import SettingsBlock from "./components/settings/SettingsBlock.vue";
+import SwitchRow from "./components/settings/SwitchRow.vue";
 
 const autoStart = ref(false);
 const fullscreenPause = ref(true);
@@ -72,8 +75,7 @@ onUnmounted(() => {
   unlistenProgress?.();
 });
 
-async function toggleAutoStart() {
-  const next = !autoStart.value;
+async function toggleAutoStart(next: boolean) {
   try {
     if (next) {
       await enable();
@@ -89,8 +91,7 @@ async function toggleAutoStart() {
   }
 }
 
-async function toggleFullscreenPause() {
-  const next = !fullscreenPause.value;
+async function toggleFullscreenPause(next: boolean) {
   try {
     await setFullscreenPause(next);
     fullscreenPause.value = next;
@@ -105,7 +106,7 @@ async function pickAndMigrate() {
   if (migrating.value) return;
   const confirmed = await ask(
     "更改存储位置会整体迁移视频与备份目录：\n" +
-      "· 需要先关闭所有屏幕的动态壁纸\n" +
+      "· 需要先关闭所有屏幕的桌面壁纸\n" +
       "· 迁移期间会临时占用额外磁盘空间\n" +
       "· 素材较多时耗时较长，过程中请勿退出应用\n\n确定继续吗？",
     { title: "更改存储位置", kind: "warning" },
@@ -154,11 +155,10 @@ async function cleanDefaultDirs() {
 
 <template>
   <section class="settings-page">
-    <div class="settings-block">
-      <h3>存储位置</h3>
+    <SettingsBlock title="存储位置">
       <p class="settings-path" :title="store.storageDir">{{ store.storageDir }}</p>
       <p class="settings-note">
-        {{ info?.customStorageActive ? "当前使用自定义位置" : "当前使用默认位置" }}。更改位置会整体迁移视频与备份目录，需先关闭所有屏幕的动态壁纸。
+        {{ info?.customStorageActive ? "当前使用自定义位置" : "当前使用默认位置" }}。更改位置会整体迁移视频与备份目录，需先关闭所有屏幕的桌面壁纸。
       </p>
       <div class="settings-actions">
         <button :disabled="migrating" @click="openDirInExplorer(store.storageDir)">
@@ -170,9 +170,11 @@ async function cleanDefaultDirs() {
         <button :disabled="migrating" @click="pickAndMigrate">更改存储位置…</button>
       </div>
       <div v-if="migrating" class="migrate-progress">
-        <div class="migrate-bar">
-          <div class="migrate-bar-fill" :style="{ width: migratePercent + '%' }" />
-        </div>
+        <el-progress
+          :percentage="migratePercent"
+          :show-text="false"
+          :stroke-width="8"
+        />
         <p class="settings-note">正在迁移 {{ migratePercent }}%，过程中请勿退出应用…</p>
       </div>
       <template v-if="info?.customStorageActive && info.defaultDirsExist">
@@ -189,49 +191,31 @@ async function cleanDefaultDirs() {
           </button>
         </div>
       </template>
-    </div>
+    </SettingsBlock>
 
-    <div class="settings-block">
-      <div class="settings-row">
-        <div>
-          <h3>开机自启</h3>
-          <p class="settings-note">登录 Windows 后自动启动 幻梦桌面（默认关闭）。</p>
-        </div>
-        <button
-          class="switch"
-          :class="{ on: autoStart }"
-          role="switch"
-          :aria-checked="autoStart"
-          :title="autoStart ? '点击关闭开机自启' : '点击开启开机自启'"
-          @click="toggleAutoStart"
-        >
-          <span class="knob" />
-        </button>
-      </div>
-    </div>
+    <SettingsBlock>
+      <SwitchRow
+        :model-value="autoStart"
+        title="开机自启"
+        desc="登录 Windows 后自动启动 幻梦桌面（默认关闭）。静默启动：只驻留托盘并恢复壁纸，不弹主窗口。"
+        on-text="点击关闭开机自启"
+        off-text="点击开启开机自启"
+        @update:model-value="toggleAutoStart"
+      />
+    </SettingsBlock>
 
-    <div class="settings-block">
-      <div class="settings-row">
-        <div>
-          <h3>全屏时暂停壁纸</h3>
-          <p class="settings-note">
-            某块屏幕被全屏应用（如游戏）占据时，只暂停该屏的壁纸以节省资源，其他屏幕不受影响。
-          </p>
-        </div>
-        <button
-          class="switch"
-          :class="{ on: fullscreenPause }"
-          role="switch"
-          :aria-checked="fullscreenPause"
-          @click="toggleFullscreenPause"
-        >
-          <span class="knob" />
-        </button>
-      </div>
-    </div>
+    <SettingsBlock>
+      <SwitchRow
+        :model-value="fullscreenPause"
+        title="全屏时暂停壁纸"
+        desc="某块屏幕被全屏或最大化的窗口完全遮盖（如游戏、最大化的浏览器/编辑器）时，只暂停该屏的壁纸以节省资源，其他屏幕不受影响。锁屏 / 息屏同样自动暂停。"
+        on-text="点击关闭：全屏时壁纸继续播放"
+        off-text="点击开启：全屏时暂停壁纸"
+        @update:model-value="toggleFullscreenPause"
+      />
+    </SettingsBlock>
 
-    <div class="settings-block">
-      <h3>关于</h3>
+    <SettingsBlock title="关于">
       <p class="settings-about">
         幻梦桌面 <span class="version">v{{ store.appVersion || "…" }}</span>
       </p>
@@ -240,7 +224,7 @@ async function cleanDefaultDirs() {
         <button @click="openWebsite">访问官网</button>
       </div>
       <!-- TODO: 版权信息与许可声明 -->
-    </div>
+    </SettingsBlock>
   </section>
 </template>
 
@@ -254,19 +238,6 @@ async function cleanDefaultDirs() {
   gap: 16px;
   width: 100%;
   max-width: 640px;
-}
-
-.settings-block {
-  background: #1b1d24;
-  border: 1px solid #2b2e37;
-  border-radius: 10px;
-  padding: 16px 18px;
-}
-
-.settings-block h3 {
-  font-size: 13px;
-  color: #9aa0ad;
-  font-weight: 600;
 }
 
 .settings-path {
@@ -302,66 +273,9 @@ async function cleanDefaultDirs() {
   margin-top: 12px;
 }
 
-.migrate-bar {
-  height: 8px;
-  border-radius: 999px;
-  background: #14161b;
-  border: 1px solid #262932;
-  overflow: hidden;
-}
-
-.migrate-bar-fill {
-  height: 100%;
-  border-radius: 999px;
-  background: #3b6ef5;
-  transition: width 0.15s;
-}
-
 .mono {
   font-family: Consolas, monospace;
   word-break: break-all;
-}
-
-.settings-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-/* 开关 */
-.switch {
-  flex-shrink: 0;
-  width: 42px;
-  height: 23px;
-  padding: 2px;
-  border-radius: 999px;
-  background: #33363f;
-  border: 1px solid #3d414b;
-  transition: background 0.15s, border-color 0.15s;
-}
-
-.switch:hover {
-  border-color: #4a4f5a;
-}
-
-.switch.on {
-  background: #3b6ef5;
-  border-color: #3b6ef5;
-}
-
-.knob {
-  display: block;
-  width: 17px;
-  height: 17px;
-  border-radius: 50%;
-  background: #cdd2dd;
-  transition: transform 0.15s;
-}
-
-.switch.on .knob {
-  background: #fff;
-  transform: translateX(19px);
 }
 
 .settings-about {

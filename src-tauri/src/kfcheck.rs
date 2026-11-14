@@ -55,11 +55,17 @@ fn read_boxes(f: &mut File, start: u64, end: u64) -> Vec<BoxInfo> {
         } else if size == 0 {
             size = end - pos;
         }
-        let Some(box_end) = pos.checked_add(size) else { break };
+        let Some(box_end) = pos.checked_add(size) else {
+            break;
+        };
         if size < 8 || box_end > end || body > box_end {
             break;
         }
-        out.push(BoxInfo { typ, body, end: box_end });
+        out.push(BoxInfo {
+            typ,
+            body,
+            end: box_end,
+        });
         pos = box_end;
     }
     out
@@ -194,23 +200,23 @@ pub fn check_video(path: &Path) -> Option<String> {
 
         // stss：关键帧样本号表。按 ISO 规范，stss 缺失 = 全部样本都是关键帧
         let stss_boxes = find_boxes(&mut f, trak_start, trak_end, b"stss");
-        let keyframes: Vec<u64> = stss_boxes
-            .first()
-            .map(|(s, e)| {
-                let p = read_payload(&mut f, *s, *e);
-                if p.len() < 8 {
-                    return Vec::new();
-                }
-                let n = u32_at(&p, 4) as usize;
-                if p.len() < 8 + n * 4 {
-                    return Vec::new();
-                }
-                (0..n).map(|i| u32_at(&p, 8 + i * 4) as u64).collect()
-            })
-            .unwrap_or_default();
         if stss_boxes.is_empty() {
             continue; // 无 stss：全部样本皆关键帧，安全
         }
+        // stss 存在但载荷读不出来（截断/IO 错误/超上限）：无法判定，
+        // 绝不能当成「没有关键帧」误报——那会把能正常播放的文件也拦下来
+        let Some((s, e)) = stss_boxes.first().copied() else {
+            continue;
+        };
+        let stss = read_payload(&mut f, s, e);
+        if stss.len() < 8 {
+            continue; // 表头不完整：无法判定
+        }
+        let n = u32_at(&stss, 4) as usize;
+        if stss.len() < 8 + n * 4 {
+            continue; // 表项截断：无法判定
+        }
+        let keyframes: Vec<u64> = (0..n).map(|i| u32_at(&stss, 8 + i * 4) as u64).collect();
         if keyframes.is_empty() {
             return Some("编码结构异常：整条视频没有关键帧".into());
         }

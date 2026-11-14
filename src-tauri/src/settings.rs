@@ -160,19 +160,17 @@ pub fn apply_storage_root(
     settings.storage_root = root;
     // 大小写不敏感比较；追加分隔符避免 "wallpapers2" 误匹配 "wallpapers" 前缀
     let old = old_wallpapers.to_string_lossy().to_ascii_lowercase();
-    settings
-        .wallpaper_assignments
-        .retain(|_, p| {
-            let p = p.to_ascii_lowercase();
-            !(p == old || p.starts_with(&format!("{old}\\")))
-        });
+    settings.wallpaper_assignments.retain(|_, p| {
+        let p = p.to_ascii_lowercase();
+        !(p == old || p.starts_with(&format!("{old}\\")))
+    });
     save_unlocked(app, &settings)
 }
 
 fn view(app: &AppHandle, settings: &Settings) -> Result<SettingsView, String> {
     let default_root = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-    let default_dirs_exist = default_root.join("wallpapers").exists()
-        || default_root.join("backup").exists();
+    let default_dirs_exist =
+        default_root.join("wallpapers").exists() || default_root.join("backup").exists();
     Ok(SettingsView {
         settings: settings.clone(),
         resolved_wallpapers_dir: resolve_wallpapers_dir(app)?.to_string_lossy().into_owned(),
@@ -182,10 +180,16 @@ fn view(app: &AppHandle, settings: &Settings) -> Result<SettingsView, String> {
     })
 }
 
+/// 读取设置视图。async + spawn_blocking：内部多次读文件并可能创建目录，
+/// 同步命令会占主线程
 #[tauri::command]
-pub fn get_settings(app: AppHandle) -> Result<SettingsView, String> {
-    let settings = load(&app);
-    view(&app, &settings)
+pub async fn get_settings(app: AppHandle) -> Result<SettingsView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = load(&app);
+        view(&app, &settings)
+    })
+    .await
+    .map_err(|e| format!("读取设置失败: {e}"))?
 }
 
 /// 更新并持久化每屏壁纸分配（label -> path）。整个读改写序列持锁，防止并发覆盖。
@@ -221,13 +225,18 @@ pub fn open_url_in_browser(url: String) -> Result<(), String> {
     tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| e.to_string())
 }
 
-/// 设置「全屏时暂停壁纸」开关（读改写持锁）
+/// 设置「全屏时暂停壁纸」开关（读改写持锁）。
+/// async + spawn_blocking：写配置文件不占主线程
 #[tauri::command]
-pub fn set_fullscreen_pause(app: AppHandle, enabled: bool) -> Result<(), String> {
-    let _guard = lock_guard();
-    let mut settings = load_unlocked(&app);
-    settings.fullscreen_pause = enabled;
-    save_unlocked(&app, &settings)?;
-    FULLSCREEN_PAUSE.store(enabled, Ordering::Relaxed);
-    Ok(())
+pub async fn set_fullscreen_pause(app: AppHandle, enabled: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock_guard();
+        let mut settings = load_unlocked(&app);
+        settings.fullscreen_pause = enabled;
+        save_unlocked(&app, &settings)?;
+        FULLSCREEN_PAUSE.store(enabled, Ordering::Relaxed);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("保存设置失败: {e}"))?
 }

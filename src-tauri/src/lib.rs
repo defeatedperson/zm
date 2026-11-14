@@ -130,7 +130,7 @@ pub struct TrayMenus {
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "暂停壁纸", true, None::<&str>)?;
-    let start = MenuItem::with_id(app, "start", "启动动态壁纸", true, None::<&str>)?;
+    let start = MenuItem::with_id(app, "start", "启动桌面壁纸", true, None::<&str>)?;
     let stop = MenuItem::with_id(app, "stop", "恢复静态壁纸", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
@@ -156,7 +156,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = wallpaper::reapply_last(&handle).await {
-                        println!("[tray] 启动动态壁纸失败: {e}");
+                        println!("[tray] 启动桌面壁纸失败: {e}");
                     }
                 });
             }
@@ -423,6 +423,8 @@ fn repair_autostart_entry(app: &tauri::AppHandle) {
     }
     match unsafe { write_run_value(&name, &desired) } {
         Ok(()) => println!("[autostart] 启动项已规范化: {desired}"),
-        Err(code) => println!("[autostart] 规范化启动项失败（不影响本次运行）: Win32 错误码 {code}"),
+        Err(code) => {
+            println!("[autostart] 规范化启动项失败（不影响本次运行）: Win32 错误码 {code}")
+        }
     }
 }

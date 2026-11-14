@@ -9,8 +9,8 @@ use std::sync::OnceLock;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    MFCreateSourceReaderFromURL, MFStartup, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_PD_DURATION,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE, MFSTARTUP_LITE, MF_VERSION,
+    MFCreateSourceReaderFromURL, MFStartup, MFSTARTUP_LITE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_PD_DURATION, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
 };
 use windows::Win32::System::Com::StructuredStorage::PropVariantToUInt64;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};

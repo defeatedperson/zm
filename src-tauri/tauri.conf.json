@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "幻梦桌面",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "identifier": "com.livepaper.app",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:14300",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
@@ -21,6 +21,7 @@
         "center": true,
         "visible": false,
         "resizable": true,
+        "decorations": false,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required"
       }
     ],
@@ -42,11 +43,10 @@
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.icns",
       "icons/icon.ico"
     ],
     "windows": {
-      "signCommand": "D:\\动态壁纸工具\\ov\\signhelper.exe %1",
+      "signCommand": "..\\ov\\signhelper.exe %1",
       "wix": {
         "language": "zh-CN"
       },

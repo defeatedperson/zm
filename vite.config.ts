@@ -12,15 +12,18 @@ export default defineConfig(async () => ({
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
+  // 端口避开 49xxx-5xxx 段：Windows 的 Hyper-V/WSL 会随机保留一批动态端口
+  // （netsh interface ipv4 show excludedportrange 可查），5173 曾被整段保留导致
+  // vite 启动报 EACCES；14300 不在常见保留段内。须与 tauri.conf.json 的 devUrl 一致
   server: {
-    port: 5173,
+    port: 14300,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 5174,
+          port: 14301,
         }
       : undefined,
     watch: {

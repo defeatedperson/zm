@@ -177,24 +177,45 @@ pub fn ensure_inside(dir: &Path, path: &Path) -> Result<(), String> {
     }
 }
 
+/// 列出画廊条目。async + spawn_blocking：目录扫描与逐文件元数据是磁盘 IO，
+/// 素材多或位于 HDD/网络盘时会卡主线程（同步命令在主线程执行）
 #[tauri::command]
-pub fn list_gallery(app: AppHandle) -> Result<Vec<GalleryEntry>, String> {
-    let dir = settings::resolve_wallpapers_dir(&app)?;
+pub async fn list_gallery(app: AppHandle) -> Result<Vec<GalleryEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_gallery_impl(&app))
+        .await
+        .map_err(|e| format!("读取画廊失败: {e}"))?
+}
+
+fn list_gallery_impl(app: &AppHandle) -> Result<Vec<GalleryEntry>, String> {
+    let dir = settings::resolve_wallpapers_dir(app)?;
 
     let mut entries = Vec::new();
-    for item in fs::read_dir(&dir).map_err(|e| format!("读取目录失败: {e}"))? {
-        let item = item.map_err(|e| format!("读取目录项失败: {e}"))?;
+    // 单个条目读取失败（正被独占、恰好被删等）只跳过该条，
+    // 不让一个坏条目拖垮整个画廊列表
+    for item in fs::read_dir(&dir)
+        .map_err(|e| format!("读取目录失败: {e}"))?
+        .flatten()
+    {
         let path = item.path();
         if !path.is_file() || (!is_video(&path) && !is_image(&path)) {
             continue;
         }
         let kind = media_kind(&path);
-        let fmeta = item.metadata().map_err(|e| format!("读取文件信息失败: {e}"))?;
+        let Ok(fmeta) = item.metadata() else {
+            continue;
+        };
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // 转码半成品（cleanup_temp_files 未能清掉的）不进画廊
+        if name.ends_with(crate::transcode::TEMP_EXT) {
+            continue;
+        }
         let modified_ms = fmeta
             .modified()
             .ok()
@@ -277,7 +298,9 @@ fn copy_with_progress(app: &AppHandle, source: &Path, dest: &Path) -> Result<(),
     let mut copied: u64 = 0;
     let mut last_emit = std::time::Instant::now();
     loop {
-        let n = src.read(&mut buf).map_err(|e| format!("读取源文件失败: {e}"))?;
+        let n = src
+            .read(&mut buf)
+            .map_err(|e| format!("读取源文件失败: {e}"))?;
         if n == 0 {
             break;
         }
@@ -346,40 +369,51 @@ fn add_wallpaper_impl(app: &AppHandle, source: &str) -> Result<GalleryEntry, Str
         size_bytes: fmeta.len(),
         modified_ms,
         // 图片可直接作为封面，立即可见
-        thumb_path: is_image(&dest)
-            .then(|| dest.to_string_lossy().into_owned()),
+        thumb_path: is_image(&dest).then(|| dest.to_string_lossy().into_owned()),
         meta,
     })
 }
 
 /// 导入素材。必须为 async：复制大文件在同步命令（主线程）执行会冻结整个应用。
+/// 标志位用 swap 抢占：并发调用第二个直接拒绝，与 optimize_start 行为一致
 #[tauri::command]
 pub async fn add_wallpaper(app: AppHandle, source: String) -> Result<GalleryEntry, String> {
-    IMPORTING.store(true, Ordering::Relaxed);
-    let result = match tauri::async_runtime::spawn_blocking(move || add_wallpaper_impl(&app, &source))
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => Err(format!("导入任务调度失败: {e}")),
-    };
+    if IMPORTING.swap(true, Ordering::AcqRel) {
+        return Err("已有导入任务进行中，请稍候".into());
+    }
+    let result =
+        match tauri::async_runtime::spawn_blocking(move || add_wallpaper_impl(&app, &source)).await
+        {
+            Ok(r) => r,
+            Err(e) => Err(format!("导入任务调度失败: {e}")),
+        };
     IMPORTING.store(false, Ordering::Relaxed);
     result
 }
 
+/// 移除素材。async + spawn_blocking：删除文件与缓存涉及磁盘 IO
 #[tauri::command]
-pub fn remove_wallpaper(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn remove_wallpaper(app: AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || remove_wallpaper_impl(&app, &path))
+        .await
+        .map_err(|e| format!("移除任务调度失败: {e}"))?
+}
+
+fn remove_wallpaper_impl(app: &AppHandle, path: &str) -> Result<(), String> {
     if crate::storage::is_migrating() {
         return Err("正在迁移存储位置，请稍候".into());
     }
-    let dir = settings::resolve_wallpapers_dir(&app)?;
-    let target = PathBuf::from(&path);
+    let dir = settings::resolve_wallpapers_dir(app)?;
+    let target = PathBuf::from(path);
     ensure_inside(&dir, &target)?;
 
-    if wallpaper::is_wallpaper_in_use(&path) {
+    if wallpaper::is_wallpaper_in_use(path) {
         return Err("该视频正在使用中，请先停止对应的屏幕壁纸".into());
     }
 
-    fs::remove_file(&target).map_err(|e| format!("删除文件失败: {e}"))?;
+    // 送回收站而非永久删除：素材是用户自己的文件，误删可找回
+    // （转码备份目录已有原件兜底，但那是优化过的素材库，不该当回收站用）
+    trash::delete(&target).map_err(|e| format!("移入回收站失败: {e}"))?;
     if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
         let thumb = thumb_path_for(&dir, name);
         if thumb.exists() {
@@ -408,14 +442,21 @@ pub fn acquire_media_lock() -> Result<std::sync::MutexGuard<'static, ()>, String
 }
 
 /// 后端生成视频封面：MF 解码目标时间点的帧 → JPEG 落盘，返回封面路径。
+/// attempt 为重新生成次数（0 = 首次）：>0 时采样点按时长比例轮换，
+/// 让「重新生成封面」每次换一帧，避免固定点位撞上坏帧时反复复现。
 /// 取代旧的前端 `<video>` + canvas 截帧（Chromium 对 4K60 High@L5.2 会退
 /// 软解，seek 停滞导致封面永远生成中/黑帧，见 mfthumb 模块说明）。
 /// 必须 async + spawn_blocking：MF 解码耗时且需 COM 初始化，不能占主线程
 #[tauri::command]
-pub async fn generate_thumbnail(app: AppHandle, path: String) -> Result<String, String> {
+pub async fn generate_thumbnail(
+    app: AppHandle,
+    path: String,
+    attempt: Option<u32>,
+) -> Result<String, String> {
     if crate::storage::is_migrating() {
         return Err("正在迁移存储位置，请稍候".into());
     }
+    let attempt = attempt.unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         let dir = settings::resolve_wallpapers_dir(&app)?;
         let target = PathBuf::from(&path);
@@ -428,11 +469,10 @@ pub async fn generate_thumbnail(app: AppHandle, path: String) -> Result<String, 
             return Err("仅支持视频生成封面".into());
         }
         let thumb = thumb_path_for(&dir, name);
-        fs::create_dir_all(dir.join(THUMB_DIR))
-            .map_err(|e| format!("创建封面目录失败: {e}"))?;
+        fs::create_dir_all(dir.join(THUMB_DIR)).map_err(|e| format!("创建封面目录失败: {e}"))?;
         // 持锁生成：转码的备份/替换会等这边的解码句柄释放
         let _guard = acquire_media_lock()?;
-        crate::mfthumb::generate(&target, &thumb)?;
+        crate::mfthumb::generate(&target, &thumb, attempt)?;
         Ok(thumb.to_string_lossy().into_owned())
     })
     .await

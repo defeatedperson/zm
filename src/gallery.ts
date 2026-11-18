@@ -46,13 +46,19 @@ export const generateThumbnail = (path: string, attempt = 0) =>
 
 export const getScreens = () => invoke<ScreenInfo[]>("get_screens");
 
-/** label 为 null 时应用到全部屏幕 */
-export const setWallpaperOn = (path: string, label: string | null) =>
-  invoke<void>("set_wallpaper_on", { path, label });
+/** 批量 set/unset 的结果：skippedTimed = 因启用定时切换而被跳过的屏幕 label */
+export interface BatchOutcome {
+  skippedTimed: string[];
+}
 
-/** label 为 null 时清除全部屏幕 */
+/** label 为 null 时应用到全部屏幕（启用定时的屏幕由后端守卫跳过并计入
+ *  skippedTimed；单屏应用到定时屏则直接报错引导去定时页） */
+export const setWallpaperOn = (path: string, label: string | null) =>
+  invoke<BatchOutcome>("set_wallpaper_on", { path, label });
+
+/** label 为 null 时清除全部屏幕（定时切换中的屏幕跳过，见 setWallpaperOn） */
 export const unsetWallpaperOn = (label: string | null) =>
-  invoke<void>("unset_wallpaper_on", { label });
+  invoke<BatchOutcome>("unset_wallpaper_on", { label });
 
 /** 启动视频优化转码（后台执行，进度经 transcode:progress/done 事件广播）。
  * targetWidth/Height 传 0 表示保持原始；fpsNum/fpsDen 传 0 表示保持原始帧率。 */

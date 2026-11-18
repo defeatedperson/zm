@@ -53,10 +53,11 @@ pub fn is_paused(label: &str) -> bool {
 fn tick(app: &AppHandle) -> Result<(), String> {
     let monitors = list_monitors(app)?;
 
-    let result = if settings::fullscreen_pause_cached() {
+    let result = if settings::fullscreen_pause_cached() && wallpaper::has_wallpaper_windows(app) {
         tick_pause(app, &monitors)
     } else {
-        // 功能关闭：确保全部恢复
+        // 功能关闭或当前没有任何壁纸窗口：跳过 EnumWindows 全屏枚举空转，
+        // 只确保全部恢复（无窗口时暂停状态表为空，resume_all 天然空操作）
         resume_all(app, &monitors)
     };
 

@@ -13,6 +13,7 @@ import ImportDialog from "./components/ImportDialog.vue";
 import GlobalContextMenu from "./components/GlobalContextMenu.vue";
 import DragDropOverlay from "./components/DragDropOverlay.vue";
 import GalleryView from "./GalleryView.vue";
+import TimedView from "./TimedView.vue";
 import SettingsView from "./SettingsView.vue";
 
 const current = computed(
@@ -57,7 +58,7 @@ onBeforeUnmount(() => {
     <section class="content">
       <TitleBar />
 
-      <div class="page-head" :class="{ constrained: store.view === 'settings' }">
+      <div class="page-head" :class="{ constrained: store.view !== 'gallery' }">
         <div>
           <h1>{{ current.label }}</h1>
           <p class="subtitle">{{ current.hint }}</p>
@@ -72,6 +73,7 @@ onBeforeUnmount(() => {
       <div class="page">
         <Transition name="view" mode="out-in">
           <GalleryView v-if="store.view === 'gallery'" />
+          <TimedView v-else-if="store.view === 'timed'" />
           <SettingsView v-else />
         </Transition>
       </div>
@@ -174,7 +176,7 @@ body,
   gap: 16px;
 }
 
-/* 设置页标题与设置卡片同宽居中；去掉水平 padding，否则标题会比卡片缩进 */
+/* 设置/定时页标题与设置卡片同宽居中；去掉水平 padding，否则标题会比卡片缩进 */
 .page-head.constrained {
   width: 100%;
   max-width: 640px;

@@ -34,7 +34,7 @@ use crate::settings;
 const WM_SPAWN_WORKERW: u32 = 0x052C;
 
 /// 每块显示器对应一个壁纸窗口，标签统一以该前缀开头
-const WALLPAPER_PREFIX: &str = "wallpaper-";
+pub(crate) const WALLPAPER_PREFIX: &str = "wallpaper-";
 
 /// WebView2 浏览器参数（壁纸窗口与静默启动的预热窗口共用）。
 ///
@@ -100,6 +100,18 @@ fn wallpaper_state() -> &'static Mutex<HashMap<String, String>> {
 fn last_wallpaper() -> &'static Mutex<Option<String>> {
     static LAST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     LAST.get_or_init(|| Mutex::new(None))
+}
+
+/// 启动恢复是否已完成（定时调度线程开跑前置检查用）
+pub(crate) fn restore_done() -> bool {
+    RESTORE_DONE.load(Ordering::Acquire)
+}
+
+/// 当前是否存在任何壁纸窗口（fullscreen 轮询的空转优化用）
+pub(crate) fn has_wallpaper_windows(app: &AppHandle) -> bool {
+    app.webview_windows()
+        .keys()
+        .any(|label| label.starts_with(WALLPAPER_PREFIX))
 }
 
 /// 指定路径是否正被任一屏幕使用
@@ -796,15 +808,95 @@ fn set_video_on_window(app: &AppHandle, label: &str, path: String) -> Result<(),
         .map_err(|e| format!("发送媒体路径失败: {e}"))
 }
 
+/// 批量 set/unset 的结果：因启用定时切换而被跳过的屏幕 label（前端提示用）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchOutcome {
+    pub skipped_timed: Vec<String>,
+}
+
+/// 单屏应用核心：懒建窗 + 挂载 + 发媒体事件（手动应用与定时调度共用）
+fn attach_and_play(app: &AppHandle, label: &str, path: &str) -> Result<(), String> {
+    attach_wallpaper_windows(app, Some(label))?;
+    set_video_on_window(app, label, path.to_string())
+}
+
+/// 调度器用：让 label 屏播放 path（挂载 + 发事件 + 登记内存态）。
+/// 不写 assignments / last_wallpaper：定时态不是手动分配，也不该污染
+/// 托盘「启动桌面壁纸」的最近记录
+pub(crate) fn sched_apply(app: &AppHandle, label: &str, path: &str) -> Result<(), String> {
+    attach_and_play(app, label, path)?;
+    if let Ok(mut state) = wallpaper_state().lock() {
+        state.insert(label.to_string(), path.to_string());
+    }
+    Ok(())
+}
+
+/// 调度器用：卸下 label 屏（脱离桌面层 + 销毁窗口 + 清内存态）。
+/// 不动 assignments——那是手动分配的持久记忆，与定时态无关
+pub(crate) fn sched_teardown(app: &AppHandle, label: &str) {
+    let _ = detach_wallpaper_windows(app, Some(label));
+    if let Some(win) = app.get_webview_window(label) {
+        let _ = win.destroy();
+    }
+    if let Ok(mut state) = wallpaper_state().lock() {
+        state.remove(label);
+    }
+}
+
+/// 调度器用：label 屏当前播放的素材路径（无壁纸为 None）
+pub(crate) fn current_media(label: &str) -> Option<String> {
+    wallpaper_state()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(label).cloned())
+}
+
+/// 当前连接显示器的 label 列表（调度器「屏未连接跳过」判定用）
+pub(crate) fn monitor_labels(app: &AppHandle) -> Result<Vec<String>, String> {
+    Ok(list_monitors(app)?
+        .iter()
+        .enumerate()
+        .map(|(i, m)| monitor_label(m, i))
+        .collect())
+}
+
+/// 批量应用的持久化：定时屏的旧分配原样保留（restore 跳过定时屏，值无意义
+/// 但动了徒增配置 diff），其余屏 = 本次已应用成功的集合。部分失败时也如实
+/// 写入已成功部分，保证重启恢复与实际播放一致
+fn persist_batch_assignments(
+    app: &AppHandle,
+    timed: &HashSet<String>,
+    applied: &[String],
+    path: &str,
+) {
+    settings::update_assignments(app, |m| {
+        m.retain(|k, _| timed.contains(k));
+        for l in applied {
+            m.insert(l.clone(), path.to_string());
+        }
+    });
+}
+
+/// 记录最近一次壁纸，供托盘「启动桌面壁纸」重新应用
+fn remember_last(path: &str) {
+    if let Ok(mut last) = last_wallpaper().lock() {
+        *last = Some(path.to_string());
+    }
+}
+
 /// 在指定屏幕（label）上应用壁纸；label 为 None 时应用到所有屏幕。
 /// 注意必须为 async：同步命令在主线程执行，而懒创建窗口需要投递回主线程，
 /// 会造成自等死锁；async 命令在线程池执行，无此问题。
+///
+/// 定时切换守卫：启用定时规则的屏幕由调度器接管——单屏直接拒绝（引导去
+/// 定时页），批量跳过并在返回值中列出（前端提示）。
 #[tauri::command]
 pub async fn set_wallpaper_on(
     app: AppHandle,
     path: String,
     label: Option<String>,
-) -> Result<(), String> {
+) -> Result<BatchOutcome, String> {
     if crate::storage::is_migrating() {
         return Err("正在迁移存储位置，请稍候".into());
     }
@@ -815,44 +907,68 @@ pub async fn set_wallpaper_on(
             "{reason}，直接播放会在循环时冻结。请先在画廊中右键该素材，使用「一键修复」"
         ));
     }
-    attach_wallpaper_windows(&app, label.as_deref())?;
-    let mut state = wallpaper_state()
-        .lock()
-        .map_err(|_| "状态锁异常".to_string())?;
+    let timed = crate::timed::enabled_labels(&app);
     if let Some(l) = &label {
-        set_video_on_window(&app, l, path.clone())?;
+        if timed.contains(l) {
+            return Err("该屏幕已启用定时切换，请在「定时切换」页关闭规则后再手动应用".into());
+        }
+        attach_and_play(&app, l, &path)?;
+        let mut state = wallpaper_state()
+            .lock()
+            .map_err(|_| "状态锁异常".to_string())?;
         state.insert(l.clone(), path.clone());
+        drop(state);
         settings::update_assignments(&app, |m| {
             m.insert(l.clone(), path.clone());
         });
-    } else {
-        // 应用到全部：给每块屏都发视频
-        let mut labels = Vec::new();
-        for (i, m) in list_monitors(&app)?.iter().enumerate() {
-            labels.push(monitor_label(m, i));
-        }
-        state.clear();
-        for l in &labels {
-            set_video_on_window(&app, l, path.clone())?;
-            state.insert(l.clone(), path.clone());
-        }
-        settings::update_assignments(&app, |m| {
-            m.clear();
-            for l in &labels {
-                m.insert(l.clone(), path.clone());
-            }
+        remember_last(&path);
+        clear_attach_error();
+        return Ok(BatchOutcome {
+            skipped_timed: vec![],
         });
     }
-    // 记录最近一次壁纸，供托盘重新应用
-    if let Ok(mut last) = last_wallpaper().lock() {
-        *last = Some(path);
+    // 应用到全部：定时屏跳过（调度器继续管理）
+    let mut labels = Vec::new();
+    let mut skipped = Vec::new();
+    for (i, m) in list_monitors(&app)?.iter().enumerate() {
+        let l = monitor_label(m, i);
+        if timed.contains(&l) {
+            skipped.push(l);
+        } else {
+            labels.push(l);
+        }
     }
+    if labels.is_empty() && !skipped.is_empty() {
+        return Err("所有屏幕都已启用定时切换，请在「定时切换」页调整".into());
+    }
+    // 清掉已断连屏的陈旧内存态（原 state.clear() 的职责收窄为：保留定时屏）
+    if let Ok(mut state) = wallpaper_state().lock() {
+        let keep: HashSet<String> = labels.iter().chain(skipped.iter()).cloned().collect();
+        state.retain(|k, _| keep.contains(k));
+    }
+    // 逐屏应用：emit 成功即提交内存态（内存与实际播放保持一致）；中途失败
+    // 时把已成功部分写入持久分配再返回错误，避免三者互相矛盾
+    let mut applied: Vec<String> = Vec::new();
+    for l in &labels {
+        if let Err(e) = attach_and_play(&app, l, &path) {
+            persist_batch_assignments(&app, &timed, &applied, &path);
+            return Err(e);
+        }
+        if let Ok(mut state) = wallpaper_state().lock() {
+            state.insert(l.clone(), path.clone());
+        }
+        applied.push(l.clone());
+    }
+    persist_batch_assignments(&app, &timed, &applied, &path);
+    remember_last(&path);
     // 本次挂载成功，启动恢复阶段残留的失败原因不再有效
     clear_attach_error();
-    Ok(())
+    Ok(BatchOutcome {
+        skipped_timed: skipped,
+    })
 }
 
-/// 托盘：把最近一次设置的壁纸重新应用到全部屏幕
+/// 托盘：把最近一次设置的壁纸重新应用到全部屏幕（定时屏由守卫自动跳过）
 pub async fn reapply_last(app: &AppHandle) -> Result<(), String> {
     let Some(path) = last_wallpaper()
         .lock()
@@ -861,7 +977,14 @@ pub async fn reapply_last(app: &AppHandle) -> Result<(), String> {
     else {
         return Err("本次运行尚未设置过桌面壁纸".into());
     };
-    set_wallpaper_on(app.clone(), path, None).await
+    let outcome = set_wallpaper_on(app.clone(), path, None).await?;
+    if !outcome.skipped_timed.is_empty() {
+        println!(
+            "[tray] 启动桌面壁纸：定时切换中的屏幕已跳过 {:?}",
+            outcome.skipped_timed
+        );
+    }
+    Ok(())
 }
 
 /// 退出前把壁纸窗口从桌面层卸下，恢复系统静态壁纸
@@ -895,6 +1018,9 @@ pub fn restore_from_settings(app: &AppHandle) {
         "[wallpaper] 恢复上次的壁纸分配（{} 项）",
         settings.wallpaper_assignments.len()
     );
+    // 启用定时规则的屏交给调度器：开机由它直挂当前时段的素材，不先恢复旧
+    // 分配再等切换（避免闪一下旧素材；调度线程等 RESTORE_DONE 后才开始 tick）
+    let timed_labels = crate::timed::enabled_labels(app);
     let mut last_path: Option<String> = None;
     let monitors = match list_monitors(app) {
         Ok(m) => m,
@@ -923,6 +1049,10 @@ pub fn restore_from_settings(app: &AppHandle) {
         let Some(path) = path else {
             continue;
         };
+        if timed_labels.contains(&label) {
+            println!("[wallpaper] {label} 已启用定时切换，跳过启动恢复（交给调度器）");
+            continue;
+        }
         if !std::path::Path::new(&path).is_file() {
             println!("[wallpaper] 跳过 {label}：文件不存在 {path}");
             continue;
@@ -1155,14 +1285,24 @@ pub fn set_user_paused(app: AppHandle, paused: bool) -> Result<(), String> {
 
 /// 在指定屏幕（label）上恢复静态壁纸；label 为 None 时清除所有屏幕。
 /// 清除后销毁对应窗口：闲置屏不再保留 webview（内存优化）。
+/// 定时切换守卫：定时屏单屏清除拒绝（引导去定时页），批量跳过定时屏
+/// 并在返回值中列出。
 #[tauri::command]
-pub async fn unset_wallpaper_on(app: AppHandle, label: Option<String>) -> Result<(), String> {
+pub async fn unset_wallpaper_on(
+    app: AppHandle,
+    label: Option<String>,
+) -> Result<BatchOutcome, String> {
+    let timed = crate::timed::enabled_labels(&app);
     let mut state = wallpaper_state()
         .lock()
         .map_err(|_| "状态锁异常".to_string())?;
     if let Some(l) = &label {
+        if timed.contains(l) {
+            return Err("该屏幕已启用定时切换，请在「定时切换」页关闭规则后再清除".into());
+        }
         let _ = app.emit_to(l, "wallpaper:clear", ());
         state.remove(l);
+        drop(state);
         // 卸下并销毁窗口，彻底释放该屏的 webview 资源
         detach_wallpaper_windows(&app, Some(l))?;
         if let Some(win) = app.get_webview_window(l) {
@@ -1171,33 +1311,51 @@ pub async fn unset_wallpaper_on(app: AppHandle, label: Option<String>) -> Result
         settings::update_assignments(&app, |m| {
             m.remove(l);
         });
-    } else {
-        let _ = app.emit("wallpaper:clear", ());
-        state.clear();
-        detach_wallpaper_windows(&app, None)?;
-        // 销毁所有壁纸窗口
-        let labels: Vec<String> = app
-            .webview_windows()
-            .into_iter()
-            .filter(|(name, _)| name.starts_with(WALLPAPER_PREFIX))
-            .map(|(name, _)| name)
-            .collect();
-        for l in labels {
-            if let Some(win) = app.get_webview_window(&l) {
-                let _ = win.destroy();
-            }
-        }
-        settings::update_assignments(&app, |m| m.clear());
+        clear_attach_error();
+        return Ok(BatchOutcome {
+            skipped_timed: vec![],
+        });
     }
+    // 批量：定时屏保留（调度器继续管理），其余卸载销毁。
+    // skipped 只报「正在显示且被保留」的定时屏——没在播的定时屏谈不上跳过
+    let mut skipped = Vec::new();
+    for l in state.keys() {
+        if timed.contains(l) {
+            skipped.push(l.clone());
+        }
+    }
+    let targets: Vec<String> = app
+        .webview_windows()
+        .keys()
+        .filter(|name| name.starts_with(WALLPAPER_PREFIX) && !timed.contains(*name))
+        .cloned()
+        .collect();
+    for t in &targets {
+        let _ = app.emit_to(t, "wallpaper:clear", ());
+    }
+    state.retain(|k, _| timed.contains(k));
+    drop(state);
+    for t in &targets {
+        detach_wallpaper_windows(&app, Some(t))?;
+        if let Some(win) = app.get_webview_window(t) {
+            let _ = win.destroy();
+        }
+    }
+    // 定时屏的旧分配保留，其余清空
+    settings::update_assignments(&app, |m| {
+        m.retain(|k, _| timed.contains(k));
+    });
     // 用户主动清除了壁纸：此前启动恢复残留的失败原因不再有意义，
     // 避免主窗口下次初始化时又拉出陈旧的红字报错
     clear_attach_error();
-    Ok(())
+    Ok(BatchOutcome {
+        skipped_timed: skipped,
+    })
 }
 
 /// 取消动态壁纸，恢复静态壁纸（全屏）。
 #[tauri::command]
-pub async fn unset_wallpaper(app: AppHandle) -> Result<(), String> {
+pub async fn unset_wallpaper(app: AppHandle) -> Result<BatchOutcome, String> {
     unset_wallpaper_on(app, None).await
 }
 

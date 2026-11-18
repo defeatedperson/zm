@@ -5,6 +5,8 @@ mod mfthumb;
 mod probe;
 mod settings;
 mod storage;
+mod timed;
+mod timed_sched;
 mod transcode;
 mod wallpaper;
 
@@ -66,6 +68,8 @@ pub fn run() {
             settings::set_fullscreen_pause,
             settings::open_path_in_explorer,
             settings::open_url_in_browser,
+            timed::get_timed_rules,
+            timed::set_timed_rules,
             gallery::list_gallery,
             gallery::add_wallpaper,
             gallery::remove_wallpaper,
@@ -111,6 +115,8 @@ pub fn run() {
             setup_main_window(app)?;
             // 全屏检测轮询线程：全屏应用占据某屏时暂停该屏壁纸
             fullscreen::start_poller(app.handle().clone());
+            // 定时切换调度线程：等启动恢复完成后按 tick 收敛每屏应显示素材
+            timed_sched::start(app.handle().clone());
             // 只有手动启动才显示主窗口；开机自启全程不碰它（见 show_main_window 注释）
             if !launched_hidden() {
                 show_main_window(app.handle());
@@ -163,8 +169,16 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             "stop" => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = wallpaper::unset_wallpaper_on(handle, None).await {
-                        println!("[tray] 恢复静态壁纸失败: {e}");
+                    match wallpaper::unset_wallpaper_on(handle, None).await {
+                        // 定时切换中的屏幕被守卫跳过：托盘无 UI，日志说明
+                        Ok(outcome) if !outcome.skipped_timed.is_empty() => {
+                            println!(
+                                "[tray] 恢复静态壁纸：定时切换中的屏幕已跳过 {:?}",
+                                outcome.skipped_timed
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => println!("[tray] 恢复静态壁纸失败: {e}"),
                     }
                 });
             }

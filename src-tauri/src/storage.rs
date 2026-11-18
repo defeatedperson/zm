@@ -74,7 +74,14 @@ fn migrate_inner(app: &AppHandle, new_root: &str) -> Result<MigrationResult, Str
 
     // —— 前置状态检查：壁纸已关闭、无导入/转码进行中 ——
     if wallpaper::any_active(app) {
-        return Err("请先关闭所有屏幕的桌面壁纸，再更改存储位置".into());
+        // 定时屏的壁纸无法在画廊清除（守卫拦截），只能先关规则让调度器卸载，
+        // 错误文案直接指路，否则用户会陷入「想关关不掉」的死角
+        let extra = if crate::timed::enabled_labels(app).is_empty() {
+            ""
+        } else {
+            "（定时切换中的屏幕请先到「定时切换」页关闭规则）"
+        };
+        return Err(format!("请先关闭所有屏幕的桌面壁纸{extra}，再更改存储位置"));
     }
     if transcode::is_transcoding() {
         return Err("正在优化视频，请等待完成后再更改存储位置".into());

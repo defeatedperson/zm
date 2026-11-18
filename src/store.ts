@@ -6,6 +6,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getSettings } from "./settings";
+import { getTimedRules, type TimedFile } from "./timed";
 import {
   addWallpaper,
   generateThumbnail,
@@ -19,7 +20,7 @@ import {
 } from "./gallery";
 
 /** 导航页 id：后续新增功能页在此扩展 */
-export type ViewId = "gallery" | "settings";
+export type ViewId = "gallery" | "timed" | "settings";
 
 export interface NavItem {
   id: ViewId;
@@ -35,6 +36,12 @@ export const NAV_ITEMS: NavItem[] = [
     id: "gallery",
     label: "桌面壁纸",
     hint: "点击封面应用到全部屏幕，右键卡片可指定单屏；也可直接拖入文件导入",
+    position: "top",
+  },
+  {
+    id: "timed",
+    label: "定时切换",
+    hint: "为每块屏幕配置定时规则：整点时刻表或固定间隔轮换",
     position: "top",
   },
   {
@@ -68,6 +75,9 @@ export interface Store {
   dragOver: boolean;
   /** 拖入的待导入文件数（悬停提示用） */
   dragCount: number;
+  /** 启用定时切换的屏幕 label（TitleBar 模式 chip 与批量操作提示用；
+   *  规则只经定时页保存变更，initApp 加载 + 保存后刷新即可覆盖全部来源） */
+  timedLabels: string[];
 }
 
 export const store = reactive<Store>({
@@ -87,7 +97,21 @@ export const store = reactive<Store>({
   importPercent: 0,
   dragOver: false,
   dragCount: 0,
+  timedLabels: [],
 });
+
+/** 从规则文件刷新「定时切换中的屏幕」跟踪（启动加载与定时页保存后调用） */
+export function updateTimedState(file: TimedFile) {
+  store.timedLabels = Object.entries(file.screens)
+    .filter(([, r]) => r.enabled)
+    .map(([label]) => label);
+}
+
+/** 定时屏 label → 展示名（优先显示器短名，找不到时退回去前缀的裸 label） */
+export function timedScreenName(label: string) {
+  const s = store.screens.find((x) => x.label === label);
+  return s ? screenShortName(s.name) : label.replace(/^wallpaper-/, "");
+}
 
 /** 全部显示器中的最大物理分辨率（卡片超规格警示与优化弹窗默认档位共用） */
 export const maxDisplay = computed(() => {
@@ -151,6 +175,13 @@ export async function initApp() {
     const { copied, total } = event.payload;
     store.importPercent =
       total > 0 ? Math.min(100, Math.floor((copied / total) * 100)) : 0;
+  });
+  // 定时切换规则（模式 chip 与批量操作提示用；失败按无定时处理，不阻塞启动）
+  getTimedRules().then(updateTimedState).catch(() => {});
+  // 定时素材全部失效的提示（调度器在健康→失效翻转时发一次；恢复静默自愈）
+  void listen<{ label: string; reason: string }>("timed:notice", (event) => {
+    const { label, reason } = event.payload;
+    setStatus(`${timedScreenName(label)}：${reason}`, true);
   });
   // 开机自启是静默启动，挂载失败可能早于上面的监听注册（事件会丢），
   // 所以再把后端存着的原因拉一次，保证弹窗时状态栏有内容
@@ -333,14 +364,19 @@ export async function applyTo(entry: GalleryEntry, label: string | null) {
   }
   store.busy = true;
   try {
-    await setWallpaperOn(entry.path, label);
+    const outcome = await setWallpaperOn(entry.path, label);
     await refresh();
     const target = label
       ? screenShortName(
           store.screens.find((s) => s.label === label)?.name ?? label,
         )
       : "全部屏幕";
-    setStatus(`已将「${entry.name}」应用到 ${target}`);
+    // 批量应用时启用定时的屏幕被后端守卫跳过，提示里说明去向
+    const skipped =
+      outcome.skippedTimed.length > 0
+        ? `（${outcome.skippedTimed.length} 块定时切换中的屏幕已跳过）`
+        : "";
+    setStatus(`已将「${entry.name}」应用到 ${target}${skipped}`);
   } catch (e) {
     setStatus(`设置失败：${e}`, true);
   } finally {
@@ -360,9 +396,13 @@ export async function clearScreen(label: string) {
 
 export async function clearAll() {
   try {
-    await unsetWallpaperOn(null);
+    const outcome = await unsetWallpaperOn(null);
     await refresh();
-    setStatus("已恢复所有屏幕的静态壁纸");
+    const skipped =
+      outcome.skippedTimed.length > 0
+        ? `（${outcome.skippedTimed.length} 块定时切换中的屏幕未清除，请到「定时切换」页关闭规则）`
+        : "";
+    setStatus(`已恢复所有屏幕的静态壁纸${skipped}`);
   } catch (e) {
     setStatus(`清除失败：${e}`, true);
   }

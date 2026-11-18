@@ -61,7 +61,13 @@ fn read_meta(dir: &Path, name: &str) -> Option<probe::VideoMeta> {
 pub fn kf_risk_of(app: &AppHandle, path: &str) -> Option<String> {
     let dir = settings::resolve_wallpapers_dir(app).ok()?;
     let name = Path::new(path).file_name()?.to_str()?;
-    read_meta(&dir, name).and_then(|m| m.kf_risk)
+    kf_risk_named(&dir, name)
+}
+
+/// kf_risk_of 的免解析变体：调用方已解析好壁纸目录 + 文件名（定时调度器
+/// 每 tick 对多条目复用同一目录解析结果，避免反复读 settings.json）
+pub fn kf_risk_named(dir: &Path, name: &str) -> Option<String> {
+    read_meta(dir, name).and_then(|m| m.kf_risk)
 }
 
 /// 写入条目元数据 sidecar（转码模块替换文件后重建元数据用）
@@ -409,6 +415,17 @@ fn remove_wallpaper_impl(app: &AppHandle, path: &str) -> Result<(), String> {
 
     if wallpaper::is_wallpaper_in_use(path) {
         return Err("该视频正在使用中，请先停止对应的屏幕壁纸".into());
+    }
+
+    // 定时列表守卫：启用定时的屏幕引用的素材不能删——调度器靠它在指定时刻
+    // 挂载，删了会静默退化为「到点回静态壁纸」。停用规则不拦（停用即惰性，
+    // 与保存校验「关掉开关永远可行」同一原则）
+    if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
+        if let Some(screen) = crate::timed::enabled_rule_using(app, name) {
+            return Err(format!(
+                "「{name}」正在 {screen} 的定时切换列表中，请先在「定时切换」页移除后再删除"
+            ));
+        }
     }
 
     // 送回收站而非永久删除：素材是用户自己的文件，误删可找回
